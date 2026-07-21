@@ -281,6 +281,28 @@ using OmegaClaw
         end
     end
 
+    @testset "autonomous multi-step plan (MetaMo chooses + gated sequence)" begin
+        # The agent must reach `shelter` — no single reflex covers it (gather → build). A MetaMo governor
+        # picks `shelter` over `idle`; the driver walks the subgoal ladder, one gated action per tick.
+        policy = Policy(Set(["echo", "write-file"]), Regex[], Regex[], Regex[], Regex[], "t", "t", true, false, nothing)
+        hut = joinpath(mktempdir(), "hut")
+        governor = (goals = [0.25, 0.75, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], mods = fill(0.5, 6),
+            stimulus = [0.2, 0.8, 0.1, 0.2],
+            candidates = [
+                (id = "shelter", corrs = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], risk = 0.0, dg = fill(0.05, 8)),
+                (id = "idle", corrs = [0.0, 0.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0], risk = 1.0, dg = zeros(8))])
+        d = Driver(; store = mktempdir(), ledger = Ledger(), policy = policy, governor = governor)
+        seed_plan!(d, "shelter", [("gather", "echo", ["got-wood"]), ("build", "write-file", [hut, "built"])])
+        r1 = step!(d, "survey")                          # goal=nothing ⇒ MetaMo picks the goal autonomously
+        @test r1.chose == "shelter"                      # chose `shelter` over `idle`
+        @test r1.action == "gather" && r1.decision === :allowed && r1.goal == "shelter__step1"   # plan step 1
+        r2 = step!(d, "survey")
+        @test r2.action == "build" && r2.decision === :allowed && r2.goal == "shelter"            # plan step 2
+        @test isfile(hut)                                # the sequence actually reached the goal
+        @test d.frontier == 0 && isempty(d.plan)         # plan complete
+        @test verify_chain(d.ledger)                     # every gated step recorded + chained
+    end
+
     @testset "driver loop over WorldModel (capabilities)" begin
         # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) → translate
         # action → governed capability (exact argv, no shell) → recorded. Heavy (constructs a WorldModel).

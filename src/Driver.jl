@@ -35,6 +35,9 @@ mutable struct Driver
     learn_space::Any                                     # lazily-built Core space (stdlib + learn_rule); nothing until used
     goal::Union{String,Nothing}
     governor::Any                                         # MetaMo (; goals,mods,stimulus,candidates) | nothing
+    plans::Dict{String,Vector{String}}                   # goal => ordered subgoal ladder (last element == goal)
+    plan::Vector{String}                                 # the active plan's subgoal sequence (empty = none active)
+    frontier::Int                                        # 1-based cursor into `plan` (which subgoal this tick pursues)
 end
 
 function Driver(; store::AbstractString = mktempdir(),
@@ -47,7 +50,8 @@ function Driver(; store::AbstractString = mktempdir(),
     return Driver(reg, loop, policy, ledger,
         Dict{String,Tuple{String,Vector{String}}}(), Dict{String,Tuple{Int,Int}}(),
         Tuple{Vector{Float64},Vector{Float64}}[], nothing, 0, String(learn_rule), nothing,
-        goal === nothing ? nothing : String(goal), governor)
+        goal === nothing ? nothing : String(goal), governor,
+        Dict{String,Vector{String}}(), String[], 0)
 end
 
 """
@@ -108,33 +112,82 @@ function _perceive(raw::AbstractString, tick::Int; modality::String = "text")
 end
 
 """
+    seed_plan!(d, goal, steps) -> d
+
+Install a MULTI-STEP plan for `goal`: `steps` is an ordered list of `(action_id, op, args)`, executed in
+sequence. Each step becomes a 1-hop reflex toward a fresh progress subgoal (`goal__step1`, `goal__step2`, …,
+and the LAST step's subgoal IS `goal`) via `seed!`. At run time the Driver walks the ladder one gated action
+per tick (`frontier`), advancing only on a clean gated action — so the agent executes the whole SEQUENCE to
+reach a goal no single reflex covers (the demo's `shelter` = `gather` → `build`). This composes `seed!` (a
+robust 1-hop reflex per subgoal) — deliberately NOT PLN's 2-hop deduction, which is inert without node STVs.
+
+For AUTONOMY, give the Driver a MetaMo `governor` whose candidate `id`s include `goal`; then `step!(d, raw)`
+(goal defaulting to `nothing`) lets MetaMo choose WHICH plan to pursue. INVARIANT: a governor `candidate.id`
+must match a `seed_plan!` (or `seed!`) goal, else that pick has nothing to run and the agent idles.
+"""
+function seed_plan!(d::Driver, goal::AbstractString, steps::AbstractVector)
+    isempty(steps) && error("seed_plan!: empty plan for goal $goal")
+    n = length(steps); ladder = String[]
+    for (i, step) in enumerate(steps)
+        aid, op, args = step
+        sg = i == n ? String(goal) : string(goal, "__step", i)   # progress token (whitespace/'=>'-free)
+        seed!(d, String(aid), sg, String(op), collect(String, args))
+        push!(ladder, sg)
+    end
+    d.plans[String(goal)] = ladder
+    return d
+end
+
+# The governor (autonomy) picks WHICH plan to pursue when none is active; else the pinned `goal`.
+function _pick_goal(d::Driver, goal)
+    d.governor === nothing && return goal
+    g = WorldModel.MetaMoCore.govern(d.governor.goals, d.governor.mods, d.governor.stimulus, d.governor.candidates)
+    return g === nothing ? goal : g.chosen
+end
+
+"""
     step!(d, raw; goal=d.goal) -> NamedTuple
 
-One agent tick. Returns `(; action, op, args, decision, result, mid)`; `decision ∈ (:allowed, :blocked,
-nothing)`. `action === nothing` (no goal / no matching rule / unbound id) is a NORMAL "no action this tick".
-Feed `result` back as the next `raw` to close the loop.
+One agent tick. Returns `(; action, op, args, decision, result, goal, chose, surprise, mid)`; `decision ∈
+(:allowed, :blocked, nothing)`. If a plan is active the tick pursues the current subgoal (the `frontier`) and
+advances on a clean gated action; `chose` is the goal MetaMo (or the pinned goal) picked when a fresh plan
+started (else `nothing`), `goal` is the subgoal actually pursued this tick. `action === nothing` (no goal / no
+matching rule / unbound id) is a NORMAL "no action this tick". Feed `result` back as the next `raw`.
 """
 function step!(d::Driver, raw::AbstractString; goal = d.goal, reinforce::Bool = false,
     learn::Bool = false, hidden::Int = 32, epochs::Int = 80)
     obs = _perceive(raw, d.loop.tick)
-    r = WorldModel.mid_step!(d.loop, obs; goal = goal, governor = d.governor)
-    # online forward-model (Sdyn) learning: measure surprise, buffer the transition, retrain when the MeTTa
-    # cadence rule fires (no Julia `retrain_every` constant — the schedule is `d.learn_rule`)
+    # plan pick (autonomy): with no active plan, the governor (or pinned goal) chooses which plan to run.
+    chose = nothing
+    if isempty(d.plan)
+        chose = _pick_goal(d, goal)
+        chose !== nothing && haskey(d.plans, chose) && (d.plan = copy(d.plans[chose]); d.frontier = 1)
+    end
+    # this tick's target = the current subgoal (frontier drives PLN selection), else the chosen/pinned goal.
+    target = !isempty(d.plan) ? d.plan[d.frontier] : (chose !== nothing ? chose : goal)
+    planned = !isempty(d.plan)
+    # governor=nothing here ON PURPOSE: we already resolved the goal (a plan pins the SUBGOAL); passing the
+    # governor to mid_step! with goal=nothing would make it act on the FINAL goal, firing the last step first.
+    r = WorldModel.mid_step!(d.loop, obs; goal = target, governor = nothing)
     surprise = learn ? _learn_step!(d, r; hidden = hidden, epochs = epochs) : nothing
     r.action === nothing &&
-        return (; action = nothing, op = nothing, args = nothing, decision = nothing, result = nothing, surprise = surprise, mid = r)
+        return (; action = nothing, op = nothing, args = nothing, decision = nothing, result = nothing, goal = target, chose = chose, surprise = surprise, mid = r)
     name = r.action[1]                                   # (id::String, score::Float64) → id
     haskey(d.actions, name) ||
-        return (; action = name, op = nothing, args = nothing, decision = nothing, result = nothing, surprise = surprise, mid = r)
+        return (; action = name, op = nothing, args = nothing, decision = nothing, result = nothing, goal = target, chose = chose, surprise = surprise, mid = r)
     op, args = d.actions[name]
     # live policy (honours a runtime reload, B6) + real op evidence for the TOCTOU snapshot (B5)
     result = governed(_live_policy(d), d.ledger, op, args, _OUTBOUND[op]; evidence = () -> _op_evidence(op, args))
     decision = startswith(result, "GATE[") ? :blocked : :allowed
-    if reinforce && r.goal isa AbstractString            # reward channel (opt-in): learn from the outcome
-        success = decision === :allowed && !startswith(result, "ERROR")
-        reinforce!(d, name, r.goal, success)
+    if planned && decision === :allowed && !startswith(result, "ERROR")   # advance the plan on a clean gated step
+        d.frontier += 1
+        d.frontier > length(d.plan) && (d.plan = String[]; d.frontier = 0)   # plan complete
     end
-    return (; action = name, op = op, args = args, decision = decision, result = result, surprise = surprise, mid = r)
+    if reinforce && target isa AbstractString            # reward channel (opt-in): learn from the outcome
+        success = decision === :allowed && !startswith(result, "ERROR")
+        reinforce!(d, name, target, success)
+    end
+    return (; action = name, op = op, args = args, decision = decision, result = result, goal = target, chose = chose, surprise = surprise, mid = r)
 end
 
 # Online forward-model step: surprise = how well the CURRENT Sdyn predicted this context from the last one;
