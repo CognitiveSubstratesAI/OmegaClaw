@@ -145,6 +145,20 @@ using OmegaClaw
         @test all(o -> o == "hello-from-channel", ch.outputs)   # each input → echo capability output
     end
 
+    @testset "Sdyn training learns a forward model (D)" begin
+        # Gather (context_t → context_{t+1}) transitions from a driver run, train the FabricPC Sdyn forward
+        # model, assert a real learning signal (train energy drops). AdamW — plain SGD diverges at this dim.
+        d = Driver(; store = mktempdir(), ledger = Ledger())
+        inputs = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+        tr = gather_transitions(d, inputs)
+        @test length(tr) == length(inputs) - 1
+        @test length(tr[1][1]) == length(tr[1][2]) > 0        # consistent, non-empty context dim
+        res = train_sdyn!(d, tr; hidden = 32, epochs = 200, adam = true)
+        @test res.n == length(tr)
+        @test isfinite(res.first_energy) && isfinite(res.last_energy)
+        @test res.last_energy < res.first_energy              # train energy dropped ⇒ Sdyn learned
+    end
+
     @testset "driver loop over WorldModel (capabilities)" begin
         # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) → translate
         # action → governed capability (exact argv, no shell) → recorded. Heavy (constructs a WorldModel).
