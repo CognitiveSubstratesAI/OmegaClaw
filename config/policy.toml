@@ -1,0 +1,24 @@
+# OmegaClaw governed-action policy manifest (WP §7.7 — the externally-rooted authority).
+# The agent does NOT write this file; it is the authority the gate consults, outside the agent's
+# revision loop. Single-quoted TOML literal strings hold the regexes verbatim (no escape processing).
+# Signature verification of this manifest is a later hardening.
+
+allow_actions = ["shell", "read-file", "http-get"]
+
+deny_patterns = [
+  'rm\s+-rf',
+  '\bmkfs\b',
+  'dd\s+if=',
+  '>\s*/dev/',
+  '\bshutdown\b',
+  '\breboot\b',
+  '/etc/(passwd|shadow)',
+  ':\(\)\s*\{\s*:\|:',
+]
+
+review_patterns = [
+  '\bsudo\b',
+  '\bgit\s+push\b',
+  '\bssh\b',
+  'curl\b.*\|\s*sh',
+]

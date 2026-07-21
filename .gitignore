@@ -1,0 +1,14 @@
+# Julia — resolved manifest + compiled cache are not committed (per the CognitiveSubstratesAI convention)
+Manifest.toml
+/compiled/
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+/docs/build/
+
+# MORK / .act zero-copy persistence + any runtime ledger dumps
+*.act
+*.ledger.jsonl
+
+# OS
+.DS_Store

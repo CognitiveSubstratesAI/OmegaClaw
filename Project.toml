@@ -1,0 +1,31 @@
+name = "OmegaClaw"
+uuid = "39761af4-3e3e-457a-8469-59bf71fa7403"
+authors = ["PRIMUS"]
+version = "0.1.0"
+
+# PRIMUS's native OmegaClaw — the whitepaper §6 operational control fabric / agent layer,
+# built on the unified MORK substrate (Core/MORK/WorldModel/FactorVSA/HMH/FabricPC) rather than
+# ported from asi-alliance/OmegaClaw-Core's PeTTa+Prolog+Python+chromadb runtime. See
+# docs/architecture/ADR-061.
+
+[deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+MORK = "162375cb-4023-4ef9-895b-22c0041d5c13"
+MeTTaCore = "c0e00000-0000-4000-8000-000000000001"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+WorldModel = "7caf2b4a-d3da-4904-9952-4838239b5f47"
+
+[sources]
+MORK = {path = "../MORK"}
+MeTTaCore = {path = "../Core"}
+WorldModel = {path = "../WorldModel"}
+
+[compat]
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
