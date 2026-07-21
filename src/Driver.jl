@@ -35,8 +35,10 @@ const DEFAULT_POLICY_RULES = raw"""
 (= (effort-baseline) 0.3)
 (= (initial-sense) (stimulus 0.1 0.5 0.1 0.3))
 (= (action-success? $d $e) (and (== $d allowed) (not $e)))
-(= (appraise $nov $hassig $prev $success $blocked)
-   (stimulus (if $hassig $nov (* $prev (novelty-decay)))
+(= (novelty $s $maxs $hassig $prev)
+   (if $hassig (if (<= $maxs 0) 0.0 (min 1.0 (max 0.0 (/ $s $maxs)))) (* $prev (novelty-decay))))
+(= (appraise $s $maxs $hassig $prev $success $blocked)
+   (stimulus (novelty $s $maxs $hassig $prev)
              (if $success 0.8 0.2)
              (if $blocked 0.8 0.1)
              (effort-baseline)))
@@ -183,14 +185,10 @@ end
 # no-signal decay are the MeTTa rule. Fail-safe: keep the prior sense (or the prior) on eval error.
 function _next_sense(d::Driver, surprise, success::Bool, blocked::Bool)
     hassig = surprise !== nothing && isfinite(surprise)
-    novnorm = if hassig
-        d.max_surprise = max(d.max_surprise, surprise)     # numeric self-normalization (organ, stays native)
-        d.max_surprise <= 0 ? 0.0 : clamp(surprise / d.max_surprise, 0.0, 1.0)
-    else
-        0.0
-    end
+    s = hassig ? Float64(surprise) : 0.0                   # L2 surprise-norm = numeric organ (like upstream embeddings)
+    hassig && (d.max_surprise = max(d.max_surprise, s))    # running-max STATE only (the sqlite-kv analog); NORMALIZATION is MeTTa
     prev = isempty(d.sense) ? 0.1 : d.sense[1]
-    expr = "(appraise $novnorm $(hassig ? "True" : "False") $prev $(success ? "True" : "False") $(blocked ? "True" : "False"))"
+    expr = "(appraise $s $(d.max_surprise) $(hassig ? "True" : "False") $prev $(success ? "True" : "False") $(blocked ? "True" : "False"))"
     st = _policy_vec(d, expr, "stimulus")
     st === nothing ? (isempty(d.sense) ? _initial_sense(d) : d.sense) : st
 end

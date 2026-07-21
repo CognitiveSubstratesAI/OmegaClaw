@@ -340,7 +340,8 @@ using OmegaClaw
         (= (effort-baseline) 0.3)
         (= (initial-sense) (stimulus 0.1 0.5 0.1 0.3))
         (= (action-success? $d $e) (and (== $d allowed) (not $e)))
-        (= (appraise $nov $hassig $prev $success $blocked) (stimulus (if $hassig $nov (* $prev (novelty-decay))) (if $success 0.8 0.2) (if $blocked 0.8 0.1) (effort-baseline)))
+        (= (novelty $s $maxs $hassig $prev) (if $hassig (if (<= $maxs 0) 0.0 (min 1.0 (max 0.0 (/ $s $maxs)))) (* $prev (novelty-decay))))
+        (= (appraise $s $maxs $hassig $prev $success $blocked) (stimulus (novelty $s $maxs $hassig $prev) (if $success 0.8 0.2) (if $blocked 0.8 0.1) (effort-baseline)))
         (= (evidence->stv $s $n $k) (STV (/ (+ $s 1) (+ $n 2)) (/ $n (+ $n $k))))
         """
         d1 = Driver(; store = mktempdir(), ledger = Ledger(), policy_rules = custom)
