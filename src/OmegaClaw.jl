@@ -35,16 +35,18 @@ const DEFAULT_LEDGER = Ref{Ledger}()
 
 function __init__()
     manifest = get(ENV, "OMEGACLAW_POLICY", joinpath(@__DIR__, "..", "config", "policy.toml"))
-    DEFAULT_POLICY[] = load_policy(manifest)
+    DEFAULT_POLICY[] = load_policy(manifest)          # signed + fail-closed when a trust key is set
     DEFAULT_LEDGER[] = Ledger(; path = get(ENV, "OMEGACLAW_LEDGER", nothing))
-    register_ops!(DEFAULT_POLICY[], DEFAULT_LEDGER[])
+    register_ops!()                                   # ops read the LIVE DEFAULT_POLICY[]/DEFAULT_LEDGER[]
     return nothing
 end
 
 export Proposal, Policy, Decision, Allow, Deny, RequireProbe, RequireReview, Defer,
-    decide, default_policy, load_policy,
+    decide, default_policy, load_policy, verify_manifest, sign_manifest!,
     Ledger, LedgerEntry, record!, verify_chain,
-    governed, register_ops!, DEFAULT_POLICY, DEFAULT_LEDGER,
+    governed, register_ops!, register_probe!, PROBE_REGISTRY,
+    DeferQueue, DEFER_QUEUE, defer!, drain_deferred!,
+    DEFAULT_POLICY, DEFAULT_LEDGER,
     Driver, seed!, step!
 
 end # module OmegaClaw

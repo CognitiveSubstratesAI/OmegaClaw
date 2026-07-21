@@ -3,7 +3,13 @@
 # revision loop. Single-quoted TOML literal strings hold the regexes verbatim (no escape processing).
 # Signature verification of this manifest is a later hardening.
 
+policy_version = "v1"
+
 allow_actions = ["shell", "read-file", "http-get"]
+
+# Actions matching these go to RequireProbe (run a read-only precheck first) or Defer (hold for prereqs).
+probe_patterns = []
+defer_patterns = []
 
 deny_patterns = [
   'rm\s+-rf',

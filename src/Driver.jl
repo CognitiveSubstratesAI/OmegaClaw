@@ -88,7 +88,9 @@ function step!(d::Driver, raw::AbstractString; goal = d.goal)
     haskey(d.actions, name) ||
         return (; action = name, op = nothing, args = nothing, decision = nothing, result = nothing, mid = r)
     op, args = d.actions[name]
-    result = governed(d.policy, d.ledger, op, args, _OUTBOUND[op])
+    # evidence snapshot: stable within this synchronous tick (TOCTOU re-check will match)
+    ev = () -> string(d.loop.tick, "|", something(goal, ""))
+    result = governed(d.policy, d.ledger, op, args, _OUTBOUND[op]; evidence = ev)
     decision = startswith(result, "GATE[") ? :blocked : :allowed
     return (; action = name, op = op, args = args, decision = decision, result = result, mid = r)
 end
