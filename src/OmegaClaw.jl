@@ -27,6 +27,7 @@ include("Gate.jl")
 include("Ledger.jl")
 include("GroundedOps.jl")
 include("Driver.jl")
+include("Channels.jl")
 
 # The live policy + ledger the registered ops run under. Set at load (__init__), from the external
 # manifest so the authority is not the agent's own code.
@@ -47,6 +48,7 @@ export Proposal, Policy, Decision, Allow, Deny, RequireProbe, RequireReview, Def
     governed, register_ops!, register_capability!, register_probe!, PROBE_REGISTRY,
     DeferQueue, DEFER_QUEUE, defer!, drain_deferred!,
     DEFAULT_POLICY, DEFAULT_LEDGER,
-    Driver, seed!, step!, reinforce!
+    Driver, seed!, step!, reinforce!,
+    OmegaChannel, BufferChannel, CLIChannel, poll, emit, run_agent!
 
 end # module OmegaClaw

@@ -134,6 +134,17 @@ using OmegaClaw
         @test !isempty(sel) && sel[1][1] == "act-good"        # PLN now prefers the reinforced-success action
     end
 
+    @testset "channels: run_agent! over a buffer channel (C)" begin
+        strict = Policy(Set(["echo"]), Regex[], Regex[], Regex[], Regex[], "t", "t", true, false, nothing)
+        d = Driver(; store = mktempdir(), ledger = Ledger(), policy = strict)
+        seed!(d, "greet", "inventory", "echo", ["hello-from-channel"])
+        ch = BufferChannel(["hi there", "again"])
+        turns = run_agent!(d, ch; goal = "inventory")
+        @test turns == 2                                  # both inputs processed
+        @test length(ch.outputs) == 2
+        @test all(o -> o == "hello-from-channel", ch.outputs)   # each input → echo capability output
+    end
+
     @testset "driver loop over WorldModel (capabilities)" begin
         # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) → translate
         # action → governed capability (exact argv, no shell) → recorded. Heavy (constructs a WorldModel).
