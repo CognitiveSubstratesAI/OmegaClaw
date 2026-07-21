@@ -111,12 +111,25 @@ end
 _ct_eq(a::AbstractVector{UInt8}, b::AbstractVector{UInt8})::Bool =
     length(a) == length(b) && (reduce(|, (a[i] ⊻ b[i] for i in eachindex(a)); init = 0x00) == 0x00)
 
-"Resolve the trust key (bytes) from OUTSIDE the agent's revision loop; `nothing` ⇒ shadow/dev mode."
-function _trust_key()::Union{Vector{UInt8},Nothing}
+const _MIN_KEY = 32   # reject key material shorter than this (B8: empty/short key ⇒ forgeable HMAC)
+
+"""
+Resolve the trust key from OUTSIDE the agent's revision loop. Returns:
+  `Vector{UInt8}` (enforcing) · `nothing` (no env ⇒ shadow/dev mode) · `:locked` (env SET but the key is
+unresolvable/too-short ⇒ FAIL CLOSED — never silently drop to shadow, B1/B8).
+"""
+function _trust_key()::Union{Vector{UInt8},Nothing,Symbol}
     kf = get(ENV, "OMEGACLAW_TRUST_KEYFILE", "")
-    isempty(kf) || (isfile(kf) && return read(kf))
+    if !isempty(kf)
+        isfile(kf) || return :locked
+        k = try; read(kf); catch; nothing; end
+        return (k !== nothing && length(k) >= _MIN_KEY) ? k : :locked
+    end
     ki = get(ENV, "OMEGACLAW_TRUST_KEY", "")
-    isempty(ki) || return Vector{UInt8}(codeunits(ki))
+    if !isempty(ki)
+        k = Vector{UInt8}(codeunits(ki))
+        return length(k) >= _MIN_KEY ? k : :locked
+    end
     return nothing
 end
 
@@ -124,50 +137,65 @@ _sig_path(path::AbstractString) = string(path, ".sig")
 
 "Operator/CI tool (run OUTSIDE the agent loop): write the detached HMAC signature sidecar for `path`."
 function sign_manifest!(path::AbstractString, key::AbstractVector{UInt8})
+    length(key) >= _MIN_KEY || error("trust key must be at least $_MIN_KEY bytes")
     sig = bytes2hex(hmac_sha256(Vector{UInt8}(key), read(path)))
     write(_sig_path(path), sig)
     return sig
 end
 
-"Verify the detached HMAC signature. False on any missing key/sig/file or hex/parse error (fail-closed)."
-function verify_manifest(path::AbstractString, key)::Bool
-    key === nothing && return false
-    sp = _sig_path(path)
-    (isfile(path) && isfile(sp)) || return false
+# Verify a detached HMAC signature over EXACT bytes (the bytes the caller will also use). Fail-closed.
+function _verify_sig(bytes::AbstractVector{UInt8}, sigpath::AbstractString, key)::Bool
+    (key === nothing || key === :locked) && return false
+    isfile(sigpath) || return false
     try
-        want = hmac_sha256(Vector{UInt8}(key), read(path))
-        got = hex2bytes(strip(read(sp, String)))
+        want = hmac_sha256(Vector{UInt8}(key), bytes)
+        got = hex2bytes(strip(read(sigpath, String)))
         return _ct_eq(want, got)
     catch
         return false
     end
 end
 
+"Verify the detached HMAC signature of `path` (convenience for callers/re-checks). Fail-closed."
+function verify_manifest(path::AbstractString, key)::Bool
+    (key === nothing || key === :locked) && return false
+    isfile(path) || return false
+    return _verify_sig(read(path), _sig_path(path), key)
+end
+
 _regexes(m, k) = Regex[Regex(String(p)) for p in get(m, k, String[])]
+
+_locked_policy(src::AbstractString)::Policy =
+    Policy(Set{String}(), Regex[], Regex[], Regex[], Regex[], "LOCKED", "unverified:" * src, false, true, src)
+
+function _parse_policy(str::AbstractString, source::AbstractString, sig_ok::Bool, enforce::Bool)::Policy
+    m = TOML.parse(str)
+    return Policy(
+        Set(String[String(a) for a in get(m, "allow_actions", String[])]),
+        _regexes(m, "deny_patterns"), _regexes(m, "review_patterns"),
+        _regexes(m, "probe_patterns"), _regexes(m, "defer_patterns"),
+        String(get(m, "policy_version", "unversioned")), source, sig_ok, enforce, source,
+    )
+end
 
 """
     load_policy(path; key=_trust_key()) -> Policy
 
 Load a policy from a signed TOML manifest OUTSIDE the agent's revision loop (§7.7 authority seam).
-FAIL-CLOSED: when a key is present (enforcing mode) and the signature is missing/invalid, return a LOCKED
-empty-allow policy (every action Denied). With no key (shadow/dev mode), parse without enforcement.
+FAIL-CLOSED: a configured-but-unresolvable trust key (B1/B8), or a present key with a missing/invalid
+signature, returns a LOCKED empty-allow policy (every action Denied). The manifest bytes are read ONCE and
+BOTH verified and parsed (no verify→reopen TOCTOU, B3). With no key (shadow/dev), parse without enforcement.
 """
 function load_policy(path::AbstractString; key = _trust_key())::Policy
-    enforce = key !== nothing
-    sig_ok = enforce ? verify_manifest(path, key) : false
-    if enforce && !sig_ok
-        return Policy(Set{String}(), Regex[], Regex[], Regex[], Regex[],
-            "LOCKED", "unverified:" * abspath(path), false, true, abspath(path))
+    key === :locked && return _locked_policy(abspath(path))
+    if key !== nothing                                        # enforcing
+        isfile(path) || return _locked_policy(abspath(path))
+        bytes = read(path)                                    # read ONCE
+        _verify_sig(bytes, _sig_path(path), key) || return _locked_policy(abspath(path))
+        return _parse_policy(String(bytes), abspath(path), true, true)   # verify + parse the SAME bytes
     end
-    isfile(path) || return default_policy()   # shadow mode only
-    m = TOML.parsefile(path)
-    return Policy(
-        Set(String[String(a) for a in get(m, "allow_actions", String[])]),
-        _regexes(m, "deny_patterns"), _regexes(m, "review_patterns"),
-        _regexes(m, "probe_patterns"), _regexes(m, "defer_patterns"),
-        String(get(m, "policy_version", "unversioned")),
-        abspath(path), sig_ok, enforce, abspath(path),
-    )
+    isfile(path) || return default_policy()                   # shadow mode only
+    return _parse_policy(read(path, String), abspath(path), false, false)
 end
 
 """

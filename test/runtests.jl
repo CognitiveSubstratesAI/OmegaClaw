@@ -83,6 +83,44 @@ using OmegaClaw
         @test startswith(governed(dp, Ledger(), "deploy", ["x"], _ -> "done"), "GATE[Defer")
     end
 
+    @testset "trust-key fail-closed on unresolvable key (B1/B8)" begin
+        dir = mktempdir(); man = joinpath(dir, "p.toml")
+        write(man, "allow_actions = [\"shell\"]\npolicy_version = \"v1\"\n")
+        withenv("OMEGACLAW_TRUST_KEYFILE" => joinpath(dir, "missing.key"), "OMEGACLAW_TRUST_KEY" => nothing) do
+            pol = load_policy(man)                                     # key set but file absent ⇒ :locked
+            @test pol.version == "LOCKED"
+            @test decide(pol, Proposal("shell", ["echo hi"])) === Deny
+        end
+        withenv("OMEGACLAW_TRUST_KEY" => "too-short", "OMEGACLAW_TRUST_KEYFILE" => nothing) do
+            @test load_policy(man).version == "LOCKED"                 # <32-byte key ⇒ LOCKED
+        end
+    end
+
+    @testset "ledger timestamp is authenticated (B2)" begin
+        led = Ledger(); e = record!(led, Proposal("shell", ["echo a"]), Allow)
+        led.entries[1] = LedgerEntry(e.seq, e.proposal_hash, e.action, e.args, e.actor,
+            e.decision, "1970-01-01T00:00:00", e.prev_hash, e.entry_hash)   # backdate ts, keep hash
+        @test !verify_chain(led)                                      # detected (was undetectable before B2)
+    end
+
+    @testset "drain_deferred! does not wedge or double-track (B4)" begin
+        q = DeferQueue()
+        dp = Policy(Set(["deploy"]), Regex[], Regex[], Regex[], Regex[r"\bdeploy\b"], "v1", "t", true, false, nothing)
+        @test startswith(governed(dp, Ledger(), "deploy", ["x"], _ -> "done"; defer_queue = q), "GATE[Defer")
+        @test length(q.items) == 1
+        gbefore = length(DEFER_QUEUE.items)
+        done = drain_deferred!(q)                                     # must terminate (no self-append DoS)
+        @test isempty(done)                                          # still defers
+        @test length(q.items) == 1                                   # re-queued to q…
+        @test length(DEFER_QUEUE.items) == gbefore                    # …NOT the global queue
+    end
+
+    @testset "passing probe authorizes execution (B9)" begin
+        pp = Policy(Set(["http-get"]), Regex[], Regex[], Regex[r"\bhttp-get\b"], Regex[], "v1", "t", true, false, nothing)
+        register_probe!("http-get", _ -> (true, "net-ok"))            # a PASSING probe
+        @test governed(pp, Ledger(), "http-get", ["x"], _ -> "fetched") == "fetched"   # now runs (was Deny)
+    end
+
     @testset "driver loop over WorldModel" begin
         # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) →
         # translate action → governed() → recorded. Heavy (constructs a WorldModel).

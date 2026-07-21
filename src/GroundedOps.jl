@@ -29,34 +29,44 @@ defer!(q::DeferQueue, policy::Policy, ledger::Ledger, action::AbstractString, ar
 
 "Re-dispatch every deferred proposal through the gate (fresh proposal/expiry/snapshot); keep those still deferring."
 function drain_deferred!(q::DeferQueue = DEFER_QUEUE)
-    lock(q.lock) do
-        still = eltype(q.items)[]
-        done = Tuple{String,String}[]
-        for (policy, ledger, action, args, run, evidence) in q.items
-            out = governed(policy, ledger, action, args, run; evidence = evidence)
-            startswith(out, "GATE[Defer") ? push!(still, (policy, ledger, action, args, run, evidence)) :
-                push!(done, (action, out))
-        end
-        q.items = still
-        return done
+    # B4: snapshot + clear UNDER LOCK, then iterate the snapshot — governed's Defer branch re-appends to `q`
+    # (routed via defer_queue=q), so we never mutate the vector we iterate (no self-append / infinite loop).
+    items = lock(q.lock) do
+        snap = copy(q.items); empty!(q.items); snap
     end
+    done = Tuple{String,String}[]
+    for (policy, ledger, action, args, run, evidence) in items
+        out = governed(policy, ledger, action, args, run; evidence = evidence, defer_queue = q)
+        startswith(out, "GATE[Defer") || push!(done, (action, out))
+    end
+    return done
 end
 
 _snap(evidence::Function)::String = bytes2hex(sha256(codeunits(String(evidence()))))
 
-# TOCTOU pre-exec re-check: ALL must hold or it is not permission (fail closed).
-function _recheck(policy::Policy, p::Proposal, evidence::Function)::Bool
+# TOCTOU pre-exec re-check: ALL must hold or it is not permission (fail closed). `expect` is the disposition
+# that routed to execution (Allow, or RequireProbe after a passing probe, B9).
+function _recheck(policy::Policy, p::Proposal, evidence::Function, expect::Decision = Allow)::Bool
     try
         (p.expiry == 0.0 || unixnow() <= p.expiry) || return false                 # not expired
         policy.version == p.policy_version || return false                          # policy unchanged
         (!policy.enforce_signature ||
             verify_manifest(policy.manifest_path, _trust_key())) || return false    # signature still valid
         _snap(evidence) == p.evidence_snapshot || return false                      # world unchanged
-        decide(policy, p) === Allow || return false                                 # decision still Allow
+        decide(policy, p) === expect || return false                                # still routes to execution
         return true
     catch
         return false
     end
+end
+
+# Real op evidence for the TOCTOU snapshot (B5): capture the precondition the op depends on.
+function _op_evidence(name::AbstractString, args::Vector{String})::String
+    if name == "read-file" && !isempty(args) && isfile(args[1])
+        st = stat(args[1])
+        return string("read-file:", args[1], ":", st.mtime, ":", st.size)
+    end
+    return string(name, ":", join(args, "\x1f"))
 end
 
 """
@@ -66,20 +76,22 @@ The single path to the world. Returns the op result on Allow, else a `GATE[...]`
 """
 function governed(policy::Policy, ledger::Ledger, action::AbstractString, args,
     run::Function; evidence::Function = () -> "", ttl_seconds::Real = _MAX_TTL,
-    capabilities = String[], predicted_effect::AbstractString = "", rollback::AbstractString = "")::String
+    capabilities = String[], predicted_effect::AbstractString = "", rollback::AbstractString = "",
+    defer_queue::DeferQueue = DEFER_QUEUE)::String
     a = collect(String, args)
     expiry = ttl_seconds == 0 ? 0.0 : unixnow() + Float64(ttl_seconds)
     p = Proposal(action, a; policy_version = policy.version, evidence_snapshot = _snap(evidence),
         expiry = expiry, capabilities = collect(String, capabilities),
         predicted_effect = predicted_effect, rollback = rollback)
     d = decide(policy, p)
+    routed = d                                  # the disposition that routes us to (or away from) execution
 
     if d === Deny
         record!(ledger, p, Deny); return "GATE[Deny]"
     elseif d === RequireReview
         record!(ledger, p, RequireReview; receipt = "review-pending"); return "GATE[RequireReview]"
     elseif d === Defer
-        record!(ledger, p, Defer); defer!(DEFER_QUEUE, policy, ledger, action, a, run; evidence = evidence)
+        record!(ledger, p, Defer); defer!(defer_queue, policy, ledger, action, a, run; evidence = evidence)
         return "GATE[Defer]"
     elseif d === RequireProbe
         f = get(PROBE_REGISTRY, String(action), nothing)
@@ -92,12 +104,12 @@ function governed(policy::Policy, ledger::Ledger, action::AbstractString, args,
         record!(ledger, Proposal("probe:" * String(action), a; policy_version = policy.version),
             ok ? Allow : Deny; receipt = "probe:" * String(ev))
         ok || (record!(ledger, p, RequireProbe; receipt = "probe-failed"); return "GATE[RequireProbe]")
-        # probe passed → fall through to the Allow execution path
+        routed = RequireProbe                   # B9: a passing probe still routes to execution
     end
 
     # Allow (or probe-passed): commit-before-exec → TOCTOU re-check → run → receipt
     record!(ledger, p, Allow)
-    _recheck(policy, p, evidence) ||
+    _recheck(policy, p, evidence, routed) ||
         (record!(ledger, p, Deny; receipt = "toctou-recheck-failed"); return "GATE[Deny]")
     out = try
         run(a)
@@ -124,26 +136,29 @@ _readfile(args::Vector{String})::String =
 
 const _OUTBOUND = Dict{String,Function}("shell" => _shell, "read-file" => _readfile)
 
-# reachability lock: a name is registered ONCE — never silently re-registered to a wider/ungoverned handler
+# idempotence guard: register_ops! won't re-register a name. NOTE (defense-in-depth only): this does NOT
+# lock the underlying MORK.GROUNDED_REGISTRY / TOKEN_REGISTRY against Julia-level rewrites — those are not
+# reachable from the MeTTa agent surface (no MeTTa builtin writes them).
 const _REGISTERED = Set{String}()
 
 """
     register_ops!()
 
 Register every outbound op on BOTH grounding lanes, each wrapped by `governed` reading the LIVE
-DEFAULT_POLICY[]/DEFAULT_LEDGER[]. Idempotent (won't re-register a name).
+DEFAULT_POLICY[]/DEFAULT_LEDGER[], passing real op evidence for the TOCTOU snapshot. Idempotent.
 """
 function register_ops!()
     for (name, run) in _OUTBOUND
         name in _REGISTERED && continue
         MORK.register_grounded!(name, function (a::Vector{String})
-            out = governed(DEFAULT_POLICY[], DEFAULT_LEDGER[], name, a, run)
+            out = governed(DEFAULT_POLICY[], DEFAULT_LEDGER[], name, a, run; evidence = () -> _op_evidence(name, a))
             return string("\"", replace(out, "\\" => "\\\\", "\"" => "\\\""), "\"")
         end)
         _SM.TOKEN_REGISTRY[name] = _SM.Grounded(_SM.Operation(name, function (xs::Vector{_SM.Atom})
             length(xs) == 1 || return _SM.ExecNoReduce()
             (xs[1] isa _SM.Grounded && xs[1].value isa AbstractString) || return _SM.ExecNoReduce()
-            out = governed(DEFAULT_POLICY[], DEFAULT_LEDGER[], name, String[String(xs[1].value)], run)
+            aa = String[String(xs[1].value)]
+            out = governed(DEFAULT_POLICY[], DEFAULT_LEDGER[], name, aa, run; evidence = () -> _op_evidence(name, aa))
             _SM.ExecOk(_SM.Atom[_SM.Grounded(out)])
         end))
         push!(_REGISTERED, name)

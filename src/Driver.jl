@@ -19,7 +19,7 @@ selection; a `governor` ⇒ MetaMo picks the goal (leave `goal=nothing`).
 mutable struct Driver
     reg::WorldModel.SpaceRegistry
     loop::WorldModel.CognitiveLoop
-    policy::Policy
+    policy::Union{Policy,Nothing}                         # nothing ⇒ read the LIVE DEFAULT_POLICY[] each tick (B6)
     ledger::Ledger
     actions::Dict{String,Tuple{String,Vector{String}}}   # action_id => (op_name, args)
     goal::Union{String,Nothing}
@@ -27,7 +27,7 @@ mutable struct Driver
 end
 
 function Driver(; store::AbstractString = mktempdir(),
-    policy::Policy = DEFAULT_POLICY[], ledger::Ledger = DEFAULT_LEDGER[],
+    policy::Union{Policy,Nothing} = nothing, ledger::Ledger = DEFAULT_LEDGER[],
     goal::Union{AbstractString,Nothing} = nothing, governor = nothing)
     reg = WorldModel.SpaceRegistry(WorldModel.manifest(; store = store))
     WorldModel.seed_world_model!(reg)
@@ -36,6 +36,9 @@ function Driver(; store::AbstractString = mktempdir(),
         Dict{String,Tuple{String,Vector{String}}}(),
         goal === nothing ? nothing : String(goal), governor)
 end
+
+"The policy this driver runs under this tick: an explicit pinned policy, else the LIVE default (B6)."
+_live_policy(d::Driver)::Policy = d.policy === nothing ? DEFAULT_POLICY[] : d.policy
 
 """
     seed!(d, action_id, goal, op, args; s=0.9, c=0.9, t=0.0) -> d
@@ -88,9 +91,8 @@ function step!(d::Driver, raw::AbstractString; goal = d.goal)
     haskey(d.actions, name) ||
         return (; action = name, op = nothing, args = nothing, decision = nothing, result = nothing, mid = r)
     op, args = d.actions[name]
-    # evidence snapshot: stable within this synchronous tick (TOCTOU re-check will match)
-    ev = () -> string(d.loop.tick, "|", something(goal, ""))
-    result = governed(d.policy, d.ledger, op, args, _OUTBOUND[op]; evidence = ev)
+    # live policy (honours a runtime reload, B6) + real op evidence for the TOCTOU snapshot (B5)
+    result = governed(_live_policy(d), d.ledger, op, args, _OUTBOUND[op]; evidence = () -> _op_evidence(op, args))
     decision = startswith(result, "GATE[") ? :blocked : :allowed
     return (; action = name, op = op, args = args, decision = decision, result = result, mid = r)
 end

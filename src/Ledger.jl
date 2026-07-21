@@ -41,10 +41,11 @@ end
 Ledger(; path::Union{AbstractString,Nothing} = nothing) =
     Ledger(path === nothing ? nothing : String(path), LedgerEntry[], ReentrantLock())
 
-function _entry_hash(seq, phash, action, args, actor, decision, pv, es, expiry, receipt, prev)::String
+function _entry_hash(seq, phash, action, args, actor, decision, pv, es, expiry, receipt, timestamp, prev)::String
     payload = _canon(String[
         string(seq), String(phash), String(action), _canon(String.(args)), String(actor),
         String(decision), String(pv), String(es), string(expiry), String(receipt),
+        String(timestamp),                                    # B2: timestamp is now authenticated
         prev === nothing ? "" : String(prev),
     ])
     return bytes2hex(sha256(codeunits(payload)))
@@ -61,10 +62,11 @@ function record!(ledger::Ledger, p::Proposal, decision::Decision; receipt::Abstr
         prev = isempty(ledger.entries) ? nothing : ledger.entries[end].entry_hash
         seq = length(ledger.entries) + 1
         d = string(decision)
+        ts = string(now(UTC))
         eh = _entry_hash(seq, p.hash, p.action, p.args, p.actor, d, p.policy_version,
-            p.evidence_snapshot, p.expiry, receipt, prev)
+            p.evidence_snapshot, p.expiry, receipt, ts, prev)
         e = LedgerEntry(seq, p.hash, p.action, p.args, p.actor, d, p.policy_version,
-            p.evidence_snapshot, p.expiry, String(receipt), string(now(UTC)), prev, eh)
+            p.evidence_snapshot, p.expiry, String(receipt), ts, prev, eh)
         push!(ledger.entries, e)
         ledger.path === nothing || _persist!(ledger.path, e)
         return e
@@ -117,7 +119,7 @@ function verify_chain(ledger::Ledger)::Bool
         e.seq == i || return false
         e.prev_hash == prev || return false
         want = _entry_hash(e.seq, e.proposal_hash, e.action, e.args, e.actor, e.decision,
-            e.policy_version, e.evidence_snapshot, e.expiry, e.receipt, prev)
+            e.policy_version, e.evidence_snapshot, e.expiry, e.receipt, e.timestamp, prev)
         e.entry_hash == want || return false
         prev = e.entry_hash
     end
