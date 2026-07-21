@@ -16,6 +16,7 @@
 const _DRIVERS = Dict{String,Driver}()          # handle → Driver: heavy state lives here, never in MeTTa
 const _TICK_MID = Dict{String,Any}()            # handle → last mid_step! result (transient, within a tick)
 const _HANDLE_CTR = Ref(0)
+const _SLOW_FIRES = Ref(0)                       # observability: cumulative oc-slow-step (ambient) firings
 
 "Register a Driver behind a small handle token the MeTTa loop can pass around."
 oc_handle!(d::Driver) = (h = "oc$(_HANDLE_CTR[] += 1)"; _DRIVERS[h] = d; h)
@@ -75,6 +76,19 @@ function _register_loop_ops!()
         _gok("ok")
     end))
 
+    # oc-slow-step — the SLOW-rate ORGAN only (§7 ambient background loop): fire WorldModel.slow_step! once
+    # (belief-decay + HMH consolidation + WILLIAM mining + SubRep admit + MOSES/GEO-EVO synthesis). The CADENCE
+    # (counter, threshold, reset) is NOT here — it lives in the MeTTa tick rule (the `$sn` loop param + the
+    # `should-consolidate` rule), mirroring Core/lib ECAN's fully-MeTTa `scan-due?`. So this grounded atom is a
+    # pure numeric organ — nothing but the FabricPC/HMH/PLN work. Best-effort: never fails the tick.
+    reg["oc-slow-step"] = _SM.Grounded(_SM.Operation("oc-slow-step", function (xs::Vector{_SM.Atom})
+        length(xs) == 1 || return _SM.ExecNoReduce()
+        h = _astr(xs[1]); d = get(_DRIVERS, h, nothing); d === nothing && return _gok("none")
+        _SLOW_FIRES[] += 1
+        _ambient_step!(d)
+        _gok("ok")
+    end))
+
     reg["oc-learn-step"] = _SM.Grounded(_SM.Operation("oc-learn-step", function (xs::Vector{_SM.Atom})
         length(xs) == 1 || return _SM.ExecNoReduce()
         h = _astr(xs[1]); d = get(_DRIVERS, h, nothing); d === nothing && return _gok("none")
@@ -101,13 +115,17 @@ end
 # The tick program — PURE MeTTa tail-recursion (upstream `(mettaclaw (+ 1 $k))` shape). Only small tokens
 # cross the ABI. `$n` is a bounded countdown (mirrors run_agent! max_turns); `$res` feeds the next `$raw`.
 const DEFAULT_OC_TICK_RULE = raw"""
-(= (oc-tick $h $goal $raw $n)
+(= (oc-tick $h $goal $raw $n $sn)
    (if (== $n 0) Done
       (let* (($tgt (oc-pick-goal $h $goal))
              ($aid (oc-mid-step $h $raw $tgt))
              ($res (oc-act $h $aid))
-             ($ok  (oc-reinforce $h $aid $tgt $res)))
-         (oc-tick $h $goal $res (- $n 1)))))
+             ($ok  (oc-reinforce $h $aid $tgt $res))
+             ($sn1 (+ $sn 1))
+             ($due (should-consolidate $sn1))
+             ($amb (if $due (oc-slow-step $h) skip))
+             ($sn2 (if $due 0 $sn1)))
+         (oc-tick $h $goal $res (- $n 1) $sn2))))
 """
 
 # A FLAT (non-recursive) single tick — the same organ chain WITHOUT the MeTTa self-recursion. Driven N times
@@ -163,9 +181,11 @@ function run_metta_loop!(d::Driver; goal::AbstractString, max_turns::Int = 100,
     h = oc_handle!(d)
     try
         sp = _SM.Space()
-        _SM.load_core_stdlib!(sp)                            # if / let* / == / - live here
+        _SM.load_core_stdlib!(sp)                            # if / let* / == / - / + / >= live here
+        _SM.load_metta!(sp, d.consolidate_rule)              # the ambient-cadence rule (should-consolidate) — editable
         _SM.load_metta!(sp, rule)                            # the tick rule (organ ops are global)
-        _SM.metta_run(_SM.parse_program("(oc-tick \"$h\" \"$goal\" \"$init\" $max_turns)")[1][2], sp)
+        # 5th arg = the slow-rate counter `$sn`, threaded PURELY in MeTTa (incremented/gated/reset in the rule).
+        _SM.metta_run(_SM.parse_program("(oc-tick \"$h\" \"$goal\" \"$init\" $max_turns 0)")[1][2], sp)
     finally
         delete!(_DRIVERS, h); delete!(_TICK_MID, h)          # release the handle
     end

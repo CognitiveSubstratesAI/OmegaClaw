@@ -363,6 +363,35 @@ using OmegaClaw
         @test verify_chain(d.ledger) && !isempty(d.ledger.entries)   # every decision recorded + chained
     end
 
+    @testset "ambient/slow rate (§7) on a MeTTa cadence (should-consolidate)" begin
+        # The SLOW rate of the two-loop×3-rate architecture: WorldModel.slow_step! (belief-decay + HMH
+        # consolidation + WILLIAM mining + SubRep admit + MOSES/GEO-EVO synthesis), rate-limited by the
+        # `should-consolidate` MeTTa cadence rule. In run_metta_loop! the WHOLE cadence (the `$sn` counter,
+        # threshold, reset) is MeTTa; the Julia grounded op `oc-slow-step` is a pure organ (mirrors Core/lib
+        # ECAN's fully-MeTTa `scan-due?`). Default K=8.
+        pol = Policy(Set(["echo"]), Regex[], Regex[], Regex[], Regex[], "t", "t", true, false, nothing)
+        mk() = (dd = Driver(; store = mktempdir(), ledger = Ledger(), policy = pol);
+                seed!(dd, "greet", "task", "echo", ["hi"]); dd)
+        # (a) MeTTa-loop path: fires 0× below K, ⌊N/K⌋× at/after K
+        OmegaClaw._SLOW_FIRES[] = 0; run_metta_loop!(mk(); goal = "task", max_turns = 2)
+        @test OmegaClaw._SLOW_FIRES[] == 0                    # cadence not due
+        OmegaClaw._SLOW_FIRES[] = 0; run_metta_loop!(mk(); goal = "task", max_turns = 16)
+        @test OmegaClaw._SLOW_FIRES[] == 2                    # fired at ticks 8 and 16
+        # (b) step! (Julia-harness path) returns the slow_step! summary on the tick it fires
+        d2 = mk(); slow_ticks = Int[]
+        for i in 1:8
+            r = step!(d2, "start"; goal = "task", ambient = true)
+            r.slow !== nothing && push!(slow_ticks, i)
+        end
+        @test slow_ticks == [8]                              # the K=8 cadence, in step!
+        # (c) the cadence is an EDITABLE MeTTa rule, not a Julia constant — re-schedule to K=3
+        d3 = Driver(; store = mktempdir(), ledger = Ledger(), policy = pol,
+                    consolidate_rule = "(= (should-consolidate \$n) (>= \$n 3))")
+        seed!(d3, "greet", "task", "echo", ["hi"])
+        OmegaClaw._SLOW_FIRES[] = 0; run_metta_loop!(d3; goal = "task", max_turns = 6)
+        @test OmegaClaw._SLOW_FIRES[] == 2                    # K=3 ⇒ fired at ticks 3 and 6
+    end
+
     @testset "driver loop over WorldModel (capabilities)" begin
         # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) → translate
         # action → governed capability (exact argv, no shell) → recorded. Heavy (constructs a WorldModel).

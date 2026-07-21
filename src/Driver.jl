@@ -21,6 +21,12 @@ selection; a `governor` ⇒ MetaMo picks the goal (leave `goal=nothing`).
 # line: the numeric organ (FabricPC train / surprise-norm) is grounded Julia, but the control policy is MeTTa.
 const DEFAULT_LEARN_RULE = "(= (should-retrain \$n \$s) (>= \$n 8))"   # surprise-aware form: (or (>= \$n 8) (> \$s θ))
 
+# The AMBIENT/SLOW-rate cadence (whitepaper §7 ambient background loop): how often WorldModel.slow_step! runs —
+# the SAME editable-atom idiom as `should-retrain` above and Core/lib ECAN's `scan-due?` (counter ≥ interval),
+# so *how often the agent consolidates in the background* is a rewritable policy atom, not a Julia constant.
+# K=8 by default (the slow rate is rate-limited vs the per-tick mid rate); tune the rule to reschedule.
+const DEFAULT_CONSOLIDATE_RULE = "(= (should-consolidate \$n) (>= \$n 8))"
+
 # The agent's cognitive-control POLICY, as MeTTa rules (inspectable + rewritable atoms), NOT Julia constants —
 # the same MeTTa-First line as the cadence rule above (verified: the ecosystem — mettaclaw/CeTTa/PeTTa —
 # keeps appraisal/estimator formulas + their coefficients in .metta, host holds only the numeric organ + FFI).
@@ -55,7 +61,9 @@ mutable struct Driver
     transitions::Vector{Tuple{Vector{Float64},Vector{Float64}}}   # online (context_t → context_{t+1}) buffer
     prev_context::Union{Vector{Float64},Nothing}         # last tick's context vector (to form a transition)
     pending::Int                                          # transitions since the last retrain (fed to the rule)
+    slow_pending::Int                                     # mid-ticks since the last ambient/slow step (fed to should-consolidate)
     learn_rule::String                                   # MeTTa `should-retrain` cadence rule (editable = re-schedule)
+    consolidate_rule::String                             # MeTTa `should-consolidate` cadence rule (ambient/slow rate — editable)
     policy_rules::String                                 # MeTTa cognitive-control policy (appraise/action-success?/evidence->stv/…) — rewritable
     learn_space::Any                                     # lazily-built Core space (stdlib + learn_rule + policy_rules); nothing until used
     goal::Union{String,Nothing}
@@ -69,14 +77,15 @@ end
 
 function Driver(; store::AbstractString = mktempdir(),
     policy::Union{Policy,Nothing} = nothing, ledger::Ledger = DEFAULT_LEDGER[],
-    learn_rule::AbstractString = DEFAULT_LEARN_RULE, policy_rules::AbstractString = DEFAULT_POLICY_RULES,
+    learn_rule::AbstractString = DEFAULT_LEARN_RULE, consolidate_rule::AbstractString = DEFAULT_CONSOLIDATE_RULE,
+    policy_rules::AbstractString = DEFAULT_POLICY_RULES,
     goal::Union{AbstractString,Nothing} = nothing, governor = nothing)
     reg = WorldModel.SpaceRegistry(WorldModel.manifest(; store = store))
     WorldModel.seed_world_model!(reg)
     loop = WorldModel.CognitiveLoop(reg)
     return Driver(reg, loop, policy, ledger,
         Dict{String,Tuple{String,Vector{String}}}(), Dict{String,Tuple{Int,Int}}(),
-        Tuple{Vector{Float64},Vector{Float64}}[], nothing, 0, String(learn_rule), String(policy_rules), nothing,
+        Tuple{Vector{Float64},Vector{Float64}}[], nothing, 0, 0, String(learn_rule), String(consolidate_rule), String(policy_rules), nothing,
         goal === nothing ? nothing : String(goal), governor,
         Dict{String,Vector{String}}(), String[], 0,
         Float64[], 0.0)   # sense: empty ⇒ lazily initialized from the `(initial-sense)` MeTTa rule on first adaptive tick
@@ -203,7 +212,7 @@ started (else `nothing`), `goal` is the subgoal actually pursued this tick. `act
 matching rule / unbound id) is a NORMAL "no action this tick". Feed `result` back as the next `raw`.
 """
 function step!(d::Driver, raw::AbstractString; goal = d.goal, reinforce::Bool = false,
-    learn::Bool = false, adaptive::Bool = false, hidden::Int = 32, epochs::Int = 80)
+    learn::Bool = false, adaptive::Bool = false, ambient::Bool = false, hidden::Int = 32, epochs::Int = 80)
     obs = _perceive(raw, d.loop.tick)
     adaptive && isempty(d.sense) && (d.sense = _initial_sense(d))   # prior affect from the (initial-sense) rule
     # plan pick (autonomy): with no active plan, the governor (or pinned goal) chooses which plan to run.
@@ -238,8 +247,17 @@ function step!(d::Driver, raw::AbstractString; goal = d.goal, reinforce::Bool = 
         end
     end
     adaptive && (d.sense = _next_sense(d, surprise, success, decision === :blocked))   # perception → motive, next pick
+    # ambient/slow rate (§7): after the goal-directed mid tick, run background consolidation on its own cadence.
+    slow = nothing
+    if ambient
+        d.slow_pending += 1
+        if _should_consolidate(d, d.slow_pending)      # ← the MeTTa cadence rule decides (editable), not a constant
+            slow = _ambient_step!(d)
+            d.slow_pending = 0
+        end
+    end
     return (; action = name, op = op, args = args, decision = decision, result = result,
-        goal = target, chose = chose, surprise = surprise, mid = r)
+        goal = target, chose = chose, surprise = surprise, mid = r, slow = slow)
 end
 
 # Online forward-model step: surprise = how well the CURRENT Sdyn predicted this context from the last one;
@@ -289,6 +307,30 @@ function _should_retrain(d::Driver, pending::Int, surprise)::Bool
     end
 end
 
+# ── ambient / slow rate — whitepaper §7 ambient background loop ───────────────
+# The SLOW rate of the two-loop×3-rate architecture, driven for the first time here. `WorldModel.slow_step!`
+# runs the ambient loop in one call: stale-belief revalidation (factor-graph PLN tightening), HMH schema
+# `consolidate!` + WILLIAM `mine!` (recurring-structure detection → Smine), SubRep `admit_proposed!` → Sopt,
+# MOSES/GEO-EVO `geo_synthesize!` → Sprog. Rate-limited by the `should-consolidate` MeTTa cadence atom (same
+# idiom as `should-retrain`). `t = loop.tick` is the monotonic belief-decay time (mid_step! advances it). Fail-
+# safe: the ambient step is best-effort background work — a failure never breaks the agent's goal-directed tick.
+function _should_consolidate(d::Driver, n::Int)::Bool
+    try
+        res = _SM.metta_run(_SM.parse_program("(should-consolidate $n)")[1][2], _policy_space(d))
+        return !isempty(res) && string(res[1]) == "True"
+    catch
+        return false
+    end
+end
+
+function _ambient_step!(d::Driver)
+    try
+        return WorldModel.slow_step!(d.loop; t = Float64(d.loop.tick))
+    catch
+        return nothing
+    end
+end
+
 # Lazily build the driver's POLICY space: Core stdlib (>=, and, not, if, arithmetic …) + the cadence rule +
 # the cognitive-control policy rules (appraise / action-success? / evidence->stv / initial-sense). Cached on
 # the driver so the stdlib load is paid ONCE, and only by drivers that actually evaluate policy.
@@ -297,6 +339,7 @@ function _policy_space(d::Driver)
         sp = _SM.Space()
         _SM.load_core_stdlib!(sp)
         _SM.load_metta!(sp, d.learn_rule)
+        _SM.load_metta!(sp, d.consolidate_rule)
         _SM.load_metta!(sp, d.policy_rules)
         d.learn_space = sp
     end
