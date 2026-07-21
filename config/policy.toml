@@ -5,7 +5,9 @@
 
 policy_version = "v1"
 
-allow_actions = ["shell", "read-file", "http-get"]
+# Capabilities the agent may invoke (default-deny: anything not listed is Denied). Each is a declared,
+# exact-argv/native operation — there is no arbitrary-shell capability.
+allow_actions = ["echo", "ls", "cat", "date", "pwd", "git", "read-file", "write-file"]
 
 # Actions matching these go to RequireProbe (run a read-only precheck first) or Defer (hold for prereqs).
 probe_patterns = []

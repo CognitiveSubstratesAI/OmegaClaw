@@ -44,7 +44,7 @@ end
 export Proposal, Policy, Decision, Allow, Deny, RequireProbe, RequireReview, Defer,
     decide, default_policy, load_policy, verify_manifest, sign_manifest!,
     Ledger, LedgerEntry, record!, verify_chain,
-    governed, register_ops!, register_probe!, PROBE_REGISTRY,
+    governed, register_ops!, register_capability!, register_probe!, PROBE_REGISTRY,
     DeferQueue, DEFER_QUEUE, defer!, drain_deferred!,
     DEFAULT_POLICY, DEFAULT_LEDGER,
     Driver, seed!, step!

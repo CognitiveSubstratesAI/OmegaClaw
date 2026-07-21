@@ -14,10 +14,10 @@ using OmegaClaw
 
     @testset "5-way decision" begin
         pol = default_policy()
-        @test decide(pol, Proposal("shell", ["echo hi"])) === Allow
-        @test decide(pol, Proposal("shell", ["rm -rf /tmp/x"])) === Deny        # deny-pattern
-        @test decide(pol, Proposal("launch-missile", ["now"])) === Deny         # unlisted action
-        @test decide(pol, Proposal("shell", ["sudo apt update"])) === RequireReview
+        @test decide(pol, Proposal("echo", ["hi"])) === Allow
+        @test decide(pol, Proposal("echo", ["rm -rf /tmp/x"])) === Deny         # deny-pattern on args
+        @test decide(pol, Proposal("launch-missile", ["now"])) === Deny         # unlisted capability (default-deny)
+        @test decide(pol, Proposal("echo", ["sudo apt update"])) === RequireReview
     end
 
     @testset "hash-chained evidence ledger" begin
@@ -37,11 +37,11 @@ using OmegaClaw
         pol = default_policy(); led = Ledger()
         ran = Ref(false)
         run = _ -> (ran[] = true; "did-run")
-        @test governed(pol, led, "shell", ["echo hi"], run) == "did-run"        # Allow → runs
+        @test governed(pol, led, "echo", ["hi"], run) == "did-run"              # Allow → runs (stub)
         @test ran[]
         ran[] = false
-        out = governed(pol, led, "shell", ["rm -rf /tmp/x"], run)
-        @test startswith(out, "GATE[Deny")                                       # Deny → blocked
+        out = governed(pol, led, "echo", ["rm -rf /tmp/x"], run)
+        @test startswith(out, "GATE[Deny")                                       # deny-pattern on args → blocked
         @test !ran[]                                                             # body never ran
         # Allow commits the decision BEFORE run + a receipt AFTER (§7.6) = 2 entries; Deny = 1 ⇒ 3 total
         @test length(led.entries) == 3
@@ -70,9 +70,9 @@ using OmegaClaw
     @testset "TOCTOU + expiry recheck (H2)" begin
         pol = default_policy(); led = Ledger()
         c = Ref(0); drift = () -> (c[] += 1; string(c[]))                          # evidence changes between decide + exec
-        @test startswith(governed(pol, led, "shell", ["echo hi"], _ -> "ran"; evidence = drift), "GATE[Deny")
-        @test startswith(governed(pol, led, "shell", ["echo hi"], _ -> "ran"; ttl_seconds = -1.0), "GATE[Deny")
-        @test governed(pol, led, "shell", ["echo hi"], _ -> "ran") == "ran"        # stable evidence ⇒ runs
+        @test startswith(governed(pol, led, "echo", ["hi"], _ -> "ran"; evidence = drift), "GATE[Deny")
+        @test startswith(governed(pol, led, "echo", ["hi"], _ -> "ran"; ttl_seconds = -1.0), "GATE[Deny")
+        @test governed(pol, led, "echo", ["hi"], _ -> "ran") == "ran"              # stable evidence ⇒ runs
     end
 
     @testset "RequireProbe + Defer (R6)" begin
@@ -121,19 +121,20 @@ using OmegaClaw
         @test governed(pp, Ledger(), "http-get", ["x"], _ -> "fetched") == "fetched"   # now runs (was Deny)
     end
 
-    @testset "driver loop over WorldModel" begin
-        # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) →
-        # translate action → governed() → recorded. Heavy (constructs a WorldModel).
-        d = Driver(; store = mktempdir(), ledger = Ledger())
-        seed!(d, "greet", "inventory", "shell", ["echo hello-from-omegaclaw"])
-        seed!(d, "wipe", "cleanup", "shell", ["rm -rf /tmp/omegaclaw-demo"])
+    @testset "driver loop over WorldModel (capabilities)" begin
+        # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) → translate
+        # action → governed capability (exact argv, no shell) → recorded. Heavy (constructs a WorldModel).
+        strict = Policy(Set(["echo"]), Regex[], Regex[], Regex[], Regex[], "test", "test", true, false, nothing)
+        d = Driver(; store = mktempdir(), ledger = Ledger(), policy = strict)
+        seed!(d, "greet", "inventory", "echo", ["hello-from-omegaclaw"])
+        seed!(d, "list", "browse", "ls", ["/tmp"])
         r1 = step!(d, "what is here"; goal = "inventory")
         @test r1.action == "greet"                       # PLN selected the seeded action
         @test r1.decision === :allowed
-        @test r1.result == "hello-from-omegaclaw"         # governed shell op ran
-        r2 = step!(d, "clean it up"; goal = "cleanup")
-        @test r2.action == "wipe"
-        @test r2.decision === :blocked                    # deny-pattern → gate blocked
+        @test r1.result == "hello-from-omegaclaw"         # echo capability ran (Cmd, no shell)
+        r2 = step!(d, "browse files"; goal = "browse")
+        @test r2.action == "list"
+        @test r2.decision === :blocked                    # ls not in the strict allow-list ⇒ default-deny
         @test startswith(r2.result, "GATE[Deny")
         @test verify_chain(d.ledger)                      # both decisions recorded + chained
     end

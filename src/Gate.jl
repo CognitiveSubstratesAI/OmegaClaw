@@ -95,13 +95,14 @@ struct Policy
     manifest_path::Union{String,Nothing}
 end
 
-"The conservative built-in policy (shadow/dev mode — signature not enforced)."
+"The conservative built-in policy (shadow/dev mode). Allows the benign default capabilities; deny/review
+patterns are defense-in-depth over the exact argv (there is no arbitrary-shell capability to evade)."
 function default_policy()::Policy
     Policy(
-        Set(["shell", "read-file", "http-get"]),
-        Regex[r"rm\s+-rf", r"\bmkfs\b", r"dd\s+if=", r":\(\)\s*\{\s*:\|:", r">\s*/dev/",
+        Set(["echo", "ls", "cat", "date", "pwd", "git", "read-file", "write-file"]),
+        Regex[r"rm\s+-rf", r"\bmkfs\b", r"dd\s+if=", r">\s*/dev/",
               r"\bshutdown\b", r"\breboot\b", r"/etc/(passwd|shadow)"],
-        Regex[r"\bsudo\b", r"\bcurl\b.*\|\s*sh", r"\bgit\s+push\b", r"\bssh\b"],
+        Regex[r"\bsudo\b", r"\bgit\s+push\b", r"\bssh\b"],
         Regex[], Regex[],
         "builtin", "builtin-default", false, false, nothing,
     )

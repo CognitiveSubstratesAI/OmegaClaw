@@ -120,21 +120,56 @@ function governed(policy::Policy, ledger::Ledger, action::AbstractString, args,
     return String(out)
 end
 
-# ── the outbound op implementations (bare effect; only ever invoked via `governed`) ──
-function _shell(args::Vector{String})::String
-    isempty(args) && return "ERROR: shell needs a command"
+# ── capability / exact-argv effect model (§7.7 default-deny; replaces the fail-open `sh -c`) ──
+# Each capability runs a SPECIFIC operation with EXACT argv via Cmd([binary; args…]) — NO shell, so there is
+# no injection / piping / chaining / glob to evade. The agent can only invoke DECLARED capabilities the
+# policy allows; there is no "run any command" primitive. Only ever invoked via `governed`.
+
+# Run an exact argv (no shell) under a hard timeout. Bytes are passed literally to the binary.
+function _run_argv(argv::Vector{String}; timeout_s::Int = 10)::String
+    isempty(argv) && return "ERROR: empty command"
     try
-        return String(strip(read(`sh -c $(args[1])`, String)))
+        cmd = Cmd(String[["timeout", "-k", "1", string(timeout_s)]; argv])   # exact argv, NO `sh -c`
+        return String(strip(read(pipeline(ignorestatus(cmd); stderr = devnull), String)))
     catch e
         return "ERROR: " * first(split(sprint(showerror, e), '\n'))
     end
 end
 
-_readfile(args::Vector{String})::String =
-    isempty(args) ? "ERROR: read-file needs a path" :
-    (isfile(args[1]) ? read(args[1], String) : "ERROR: no such file: $(args[1])")
+# A binary capability: fixed binary, caller supplies only the trailing argv (still exact, no shell).
+_argv_cap(binary::String)::Function = (args::Vector{String}) -> _run_argv(String[binary; args])
 
-const _OUTBOUND = Dict{String,Function}("shell" => _shell, "read-file" => _readfile)
+function _cap_readfile(args::Vector{String})::String
+    isempty(args) && return "ERROR: read-file needs a path"
+    isfile(args[1]) ? read(args[1], String) : "ERROR: no such file: $(args[1])"
+end
+
+function _cap_writefile(args::Vector{String})::String
+    length(args) >= 2 || return "ERROR: write-file needs (path, content)"
+    try
+        write(args[1], args[2])
+        return "wrote $(ncodeunits(args[2])) bytes to $(args[1])"
+    catch e
+        return "ERROR: " * first(split(sprint(showerror, e), '\n'))
+    end
+end
+
+# The capability registry = the governed outbound ops. Built-ins are benign, exact-argv/native — note the
+# ABSENCE of any arbitrary-shell / rm / eval primitive: dangerous operations simply are not capabilities.
+const _CAPABILITIES = Dict{String,Function}(
+    "echo" => _argv_cap("echo"),
+    "ls" => _argv_cap("ls"),
+    "cat" => _argv_cap("cat"),
+    "date" => _argv_cap("date"),
+    "pwd" => _argv_cap("pwd"),
+    "git" => _argv_cap("git"),
+    "read-file" => _cap_readfile,
+    "write-file" => _cap_writefile,
+)
+const _OUTBOUND = _CAPABILITIES   # alias: the governed ops ARE the registered capabilities
+
+"Register (or replace) a capability. Call `register_ops!()` afterwards to expose it on the MeTTa lanes."
+register_capability!(name::AbstractString, fn::Function) = (_CAPABILITIES[String(name)] = fn; nothing)
 
 # idempotence guard: register_ops! won't re-register a name. NOTE (defense-in-depth only): this does NOT
 # lock the underlying MORK.GROUNDED_REGISTRY / TOKEN_REGISTRY against Julia-level rewrites — those are not
