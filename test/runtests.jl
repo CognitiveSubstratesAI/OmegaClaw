@@ -303,6 +303,52 @@ using OmegaClaw
         @test verify_chain(d.ledger)                     # every gated step recorded + chained
     end
 
+    @testset "adaptive autonomy — motive state evolves from experience" begin
+        # The stimulus is derived from the agent's own experience each tick (surprise→novelty, gate→con/risk);
+        # the OpenPsi appraisal evolves the modulators, which carry forward and shape the next goal choice.
+        policy = Policy(Set(["echo"]), Regex[], Regex[], Regex[], Regex[], "t", "t", true, false, nothing)
+        init_mods = fill(0.5, 6)
+        governor = (goals = [0.25, 0.75, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5], mods = copy(init_mods),
+            stimulus = [0.2, 0.5, 0.1, 0.3],
+            candidates = [
+                (id = "explore", corrs = [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], risk = 0.0, dg = fill(0.05, 8)),
+                (id = "settle", corrs = [0.0, 0.0, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2], risk = 0.3, dg = zeros(8))])
+        d = Driver(; store = mktempdir(), ledger = Ledger(), policy = policy, governor = governor,
+            learn_rule = "(= (should-retrain \$n \$s) (>= \$n 3))")
+        seed!(d, "look", "explore", "echo", ["exploring"])
+        seed!(d, "rest", "settle", "echo", ["settling"])
+        chosen = String[]
+        for raw in ["a", "b", "c", "d", "e", "f"]
+            r = step!(d, raw; adaptive = true, learn = true, hidden = 16, epochs = 30)
+            push!(chosen, string(r.chose))
+        end
+        @test all(c -> c in ("explore", "settle"), chosen)   # a goal chosen autonomously every tick
+        @test d.governor.mods != init_mods                   # the affect (modulator) state EVOLVED from experience
+        @test d.sense != [0.1, 0.5, 0.1, 0.3]                # perception updated the stimulus (not the baseline)
+        @test verify_chain(d.ledger)                         # every gated action recorded + chained
+    end
+
+    @testset "cognitive-control policy is a rewritable MeTTa atom (not hardcoded Julia)" begin
+        # The reward estimator (count→STV) is a MeTTa rule; override it per-driver ⇒ different behavior,
+        # proving it's an inspectable/rewritable atom, not a Julia constant.
+        d0 = Driver(; store = mktempdir(), ledger = Ledger())
+        r0 = reinforce!(d0, "a", "g", true)                  # default evidence->stv: strength=s/n, conf=n/(n+k)
+        @test r0.strength ≈ 1.0 && r0.confidence ≈ 0.5       # 1/1, 1/(1+1)
+        # a custom policy that Laplace-smooths strength (s+1)/(n+2) — same rules, one line changed
+        custom = raw"""
+        (= (novelty-decay) 0.9)
+        (= (effort-baseline) 0.3)
+        (= (initial-sense) (stimulus 0.1 0.5 0.1 0.3))
+        (= (action-success? $d $e) (and (== $d allowed) (not $e)))
+        (= (appraise $nov $hassig $prev $success $blocked) (stimulus (if $hassig $nov (* $prev (novelty-decay))) (if $success 0.8 0.2) (if $blocked 0.8 0.1) (effort-baseline)))
+        (= (evidence->stv $s $n $k) (STV (/ (+ $s 1) (+ $n 2)) (/ $n (+ $n $k))))
+        """
+        d1 = Driver(; store = mktempdir(), ledger = Ledger(), policy_rules = custom)
+        r1 = reinforce!(d1, "a", "g", true)
+        @test r1.strength ≈ 2 / 3                            # Laplace (1+1)/(1+2) — the rewritten rule took effect
+        @test r1.strength != r0.strength                     # same inputs, different policy ⇒ different STV
+    end
+
     @testset "driver loop over WorldModel (capabilities)" begin
         # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) → translate
         # action → governed capability (exact argv, no shell) → recorded. Heavy (constructs a WorldModel).

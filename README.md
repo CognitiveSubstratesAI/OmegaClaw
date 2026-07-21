@@ -42,6 +42,14 @@ Outbound ops are **dual-registered** (`MORK.register_grounded!` for the compiled
 interpreter's `TOKEN_REGISTRY` fallback), so `!(echo "…")` runs identically whether Core compiles or
 interprets it, and always behind the gate.
 
+**Cognitive-control policy is MeTTa, not Julia.** Following the ecosystem split (cognition/control/policy →
+MeTTa; host → runtime + numeric organs + FFI), the agent's control *rules* are MeTTa atoms evaluated via
+Core, per-driver rewritable — the retrain cadence `(should-retrain $n $s)`, the experience→affect appraisal
+`(appraise …)` and its channel weights, the success predicate `(action-success? …)`, and the reward
+estimator `(evidence->stv $s $n $k)`. Julia keeps only the numeric organs (FabricPC training, the surprise
+L2-norm), the marshalling, the driver harness, and — deliberately native, driven by *signed data* not
+rewritable atoms — the security **gate** (`decide`, capabilities, TOCTOU/HMAC, fail-closed lockdown).
+
 ## Security posture (B7/B10)
 
 Tamper-**resistant**, adversarially verified over three red-team rounds:

@@ -21,6 +21,28 @@ selection; a `governor` ⇒ MetaMo picks the goal (leave `goal=nothing`).
 # line: the numeric organ (FabricPC train / surprise-norm) is grounded Julia, but the control policy is MeTTa.
 const DEFAULT_LEARN_RULE = "(= (should-retrain \$n \$s) (>= \$n 8))"   # surprise-aware form: (or (>= \$n 8) (> \$s θ))
 
+# The agent's cognitive-control POLICY, as MeTTa rules (inspectable + rewritable atoms), NOT Julia constants —
+# the same MeTTa-First line as the cadence rule above (verified: the ecosystem — mettaclaw/CeTTa/PeTTa —
+# keeps appraisal/estimator formulas + their coefficients in .metta, host holds only the numeric organ + FFI).
+# `appraise`  : experience → the 4-channel MetaMo stimulus (novelty,conduciveness,risk,effort). The novelty
+#               NUMBER (surprise/max, self-normalized) is computed native and passed in; the channel weights
+#               and the no-signal decay are policy here.
+# `action-success?` : what COUNTS as a successful action (drives the stimulus, plan-advance, and reward).
+# `evidence->stv`   : the reward-outcome → PLN truth-value estimator (frequency + count→confidence, k = PLN
+#               look-ahead). `initial-sense` : the agent's prior affect disposition.
+const DEFAULT_POLICY_RULES = raw"""
+(= (novelty-decay) 0.9)
+(= (effort-baseline) 0.3)
+(= (initial-sense) (stimulus 0.1 0.5 0.1 0.3))
+(= (action-success? $d $e) (and (== $d allowed) (not $e)))
+(= (appraise $nov $hassig $prev $success $blocked)
+   (stimulus (if $hassig $nov (* $prev (novelty-decay)))
+             (if $success 0.8 0.2)
+             (if $blocked 0.8 0.1)
+             (effort-baseline)))
+(= (evidence->stv $s $n $k) (STV (/ $s $n) (/ $n (+ $n $k))))
+"""
+
 mutable struct Driver
     reg::WorldModel.SpaceRegistry
     loop::WorldModel.CognitiveLoop
@@ -32,26 +54,30 @@ mutable struct Driver
     prev_context::Union{Vector{Float64},Nothing}         # last tick's context vector (to form a transition)
     pending::Int                                          # transitions since the last retrain (fed to the rule)
     learn_rule::String                                   # MeTTa `should-retrain` cadence rule (editable = re-schedule)
-    learn_space::Any                                     # lazily-built Core space (stdlib + learn_rule); nothing until used
+    policy_rules::String                                 # MeTTa cognitive-control policy (appraise/action-success?/evidence->stv/…) — rewritable
+    learn_space::Any                                     # lazily-built Core space (stdlib + learn_rule + policy_rules); nothing until used
     goal::Union{String,Nothing}
     governor::Any                                         # MetaMo (; goals,mods,stimulus,candidates) | nothing
     plans::Dict{String,Vector{String}}                   # goal => ordered subgoal ladder (last element == goal)
     plan::Vector{String}                                 # the active plan's subgoal sequence (empty = none active)
     frontier::Int                                        # 1-based cursor into `plan` (which subgoal this tick pursues)
+    sense::Vector{Float64}                               # adaptive stimulus (novelty,conduciveness,risk,effort) from last tick
+    max_surprise::Float64                                # running max surprise — normalizes surprise → novelty ∈ [0,1]
 end
 
 function Driver(; store::AbstractString = mktempdir(),
     policy::Union{Policy,Nothing} = nothing, ledger::Ledger = DEFAULT_LEDGER[],
-    learn_rule::AbstractString = DEFAULT_LEARN_RULE,
+    learn_rule::AbstractString = DEFAULT_LEARN_RULE, policy_rules::AbstractString = DEFAULT_POLICY_RULES,
     goal::Union{AbstractString,Nothing} = nothing, governor = nothing)
     reg = WorldModel.SpaceRegistry(WorldModel.manifest(; store = store))
     WorldModel.seed_world_model!(reg)
     loop = WorldModel.CognitiveLoop(reg)
     return Driver(reg, loop, policy, ledger,
         Dict{String,Tuple{String,Vector{String}}}(), Dict{String,Tuple{Int,Int}}(),
-        Tuple{Vector{Float64},Vector{Float64}}[], nothing, 0, String(learn_rule), nothing,
+        Tuple{Vector{Float64},Vector{Float64}}[], nothing, 0, String(learn_rule), String(policy_rules), nothing,
         goal === nothing ? nothing : String(goal), governor,
-        Dict{String,Vector{String}}(), String[], 0)
+        Dict{String,Vector{String}}(), String[], 0,
+        Float64[], 0.0)   # sense: empty ⇒ lazily initialized from the `(initial-sense)` MeTTa rule on first adaptive tick
 end
 
 """
@@ -65,9 +91,9 @@ actions that were blocked or errored. Re-uses WorldModel's own `assert_implicati
 function reinforce!(d::Driver, action_id::AbstractString, goal::AbstractString, success::Bool; k::Int = 1)
     s0, n0 = get(d.outcomes, String(action_id), (0, 0))
     s1, n1 = s0 + (success ? 1 : 0), n0 + 1
-    d.outcomes[String(action_id)] = (s1, n1)
-    strength = s1 / n1
-    confidence = n1 / (n1 + k)                            # 0.5 at 1 attempt → 0.9 at 9
+    d.outcomes[String(action_id)] = (s1, n1)              # counter accumulation = native bookkeeping
+    stv = _policy_vec(d, "(evidence->stv $s1 $n1 $k)", "STV")   # count→STV estimator = MeTTa policy (fail-safe native)
+    strength, confidence = stv === nothing ? (s1 / n1, n1 / (n1 + k)) : (stv[1], stv[2])
     WorldModel.assert_implication!(d.reg, action_id, goal, strength, confidence, float(d.loop.tick))
     return (; action = String(action_id), goal = String(goal), success = success,
         strength = strength, confidence = confidence, attempts = n1)
@@ -138,11 +164,35 @@ function seed_plan!(d::Driver, goal::AbstractString, steps::AbstractVector)
     return d
 end
 
-# The governor (autonomy) picks WHICH plan to pursue when none is active; else the pinned `goal`.
-function _pick_goal(d::Driver, goal)
+# The governor (autonomy) picks WHICH plan/goal to pursue; else the pinned `goal`. In ADAPTIVE mode the
+# stimulus is the agent's own `sense` (surprise→novelty, gate outcomes→conduciveness/risk) and the evolved
+# modulators are carried forward — so the motive state is DYNAMIC, shaped by experience, not a fixed governor.
+function _pick_goal(d::Driver, goal, adaptive::Bool)
     d.governor === nothing && return goal
-    g = WorldModel.MetaMoCore.govern(d.governor.goals, d.governor.mods, d.governor.stimulus, d.governor.candidates)
-    return g === nothing ? goal : g.chosen
+    gv = d.governor
+    stim = adaptive ? d.sense : collect(Float64, gv.stimulus)
+    g = WorldModel.MetaMoCore.govern(gv.goals, gv.mods, stim, gv.candidates)
+    g === nothing && return goal
+    adaptive && (d.governor = merge(gv, (mods = g.mods, stimulus = stim)))   # carry the evolved affect state forward
+    return g.chosen
+end
+
+# Next tick's 4-channel stimulus from THIS tick's experience, via the `appraise` MeTTa POLICY rule (the
+# perception→motive channel; MetaMo's (novelty,conduciveness,risk,effort) — MetaMoCore.jl:64). Julia computes
+# ONLY the numeric novelty MAGNITUDE (self-normalized surprise) — a numeric organ; the channel WEIGHTS and the
+# no-signal decay are the MeTTa rule. Fail-safe: keep the prior sense (or the prior) on eval error.
+function _next_sense(d::Driver, surprise, success::Bool, blocked::Bool)
+    hassig = surprise !== nothing && isfinite(surprise)
+    novnorm = if hassig
+        d.max_surprise = max(d.max_surprise, surprise)     # numeric self-normalization (organ, stays native)
+        d.max_surprise <= 0 ? 0.0 : clamp(surprise / d.max_surprise, 0.0, 1.0)
+    else
+        0.0
+    end
+    prev = isempty(d.sense) ? 0.1 : d.sense[1]
+    expr = "(appraise $novnorm $(hassig ? "True" : "False") $prev $(success ? "True" : "False") $(blocked ? "True" : "False"))"
+    st = _policy_vec(d, expr, "stimulus")
+    st === nothing ? (isempty(d.sense) ? _initial_sense(d) : d.sense) : st
 end
 
 """
@@ -155,12 +205,13 @@ started (else `nothing`), `goal` is the subgoal actually pursued this tick. `act
 matching rule / unbound id) is a NORMAL "no action this tick". Feed `result` back as the next `raw`.
 """
 function step!(d::Driver, raw::AbstractString; goal = d.goal, reinforce::Bool = false,
-    learn::Bool = false, hidden::Int = 32, epochs::Int = 80)
+    learn::Bool = false, adaptive::Bool = false, hidden::Int = 32, epochs::Int = 80)
     obs = _perceive(raw, d.loop.tick)
+    adaptive && isempty(d.sense) && (d.sense = _initial_sense(d))   # prior affect from the (initial-sense) rule
     # plan pick (autonomy): with no active plan, the governor (or pinned goal) chooses which plan to run.
     chose = nothing
     if isempty(d.plan)
-        chose = _pick_goal(d, goal)
+        chose = _pick_goal(d, goal, adaptive)
         chose !== nothing && haskey(d.plans, chose) && (d.plan = copy(d.plans[chose]); d.frontier = 1)
     end
     # this tick's target = the current subgoal (frontier drives PLN selection), else the chosen/pinned goal.
@@ -170,24 +221,27 @@ function step!(d::Driver, raw::AbstractString; goal = d.goal, reinforce::Bool = 
     # governor to mid_step! with goal=nothing would make it act on the FINAL goal, firing the last step first.
     r = WorldModel.mid_step!(d.loop, obs; goal = target, governor = nothing)
     surprise = learn ? _learn_step!(d, r; hidden = hidden, epochs = epochs) : nothing
-    r.action === nothing &&
-        return (; action = nothing, op = nothing, args = nothing, decision = nothing, result = nothing, goal = target, chose = chose, surprise = surprise, mid = r)
-    name = r.action[1]                                   # (id::String, score::Float64) → id
-    haskey(d.actions, name) ||
-        return (; action = name, op = nothing, args = nothing, decision = nothing, result = nothing, goal = target, chose = chose, surprise = surprise, mid = r)
-    op, args = d.actions[name]
-    # live policy (honours a runtime reload, B6) + real op evidence for the TOCTOU snapshot (B5)
-    result = governed(_live_policy(d), d.ledger, op, args, _OUTBOUND[op]; evidence = () -> _op_evidence(op, args))
-    decision = startswith(result, "GATE[") ? :blocked : :allowed
-    if planned && decision === :allowed && !startswith(result, "ERROR")   # advance the plan on a clean gated step
-        d.frontier += 1
-        d.frontier > length(d.plan) && (d.plan = String[]; d.frontier = 0)   # plan complete
+
+    name = r.action === nothing ? nothing : r.action[1]  # (id::String, score::Float64) → id
+    op = args = result = decision = nothing
+    success = false
+    if name !== nothing && haskey(d.actions, name)
+        op, args = d.actions[name]
+        # live policy (honours a runtime reload, B6) + real op evidence for the TOCTOU snapshot (B5)
+        result = governed(_live_policy(d), d.ledger, op, args, _OUTBOUND[op]; evidence = () -> _op_evidence(op, args))
+        decision = startswith(result, "GATE[") ? :blocked : :allowed
+        success = _action_success(d, decision, result)   # the `action-success?` MeTTa rule (once, reused below)
+        if planned && success                            # advance the plan on a clean gated step
+            d.frontier += 1
+            d.frontier > length(d.plan) && (d.plan = String[]; d.frontier = 0)   # plan complete
+        end
+        if reinforce && target isa AbstractString        # reward channel (opt-in): learn from the outcome
+            reinforce!(d, name, target, success)
+        end
     end
-    if reinforce && target isa AbstractString            # reward channel (opt-in): learn from the outcome
-        success = decision === :allowed && !startswith(result, "ERROR")
-        reinforce!(d, name, target, success)
-    end
-    return (; action = name, op = op, args = args, decision = decision, result = result, goal = target, chose = chose, surprise = surprise, mid = r)
+    adaptive && (d.sense = _next_sense(d, surprise, success, decision === :blocked))   # perception → motive, next pick
+    return (; action = name, op = op, args = args, decision = decision, result = result,
+        goal = target, chose = chose, surprise = surprise, mid = r)
 end
 
 # Online forward-model step: surprise = how well the CURRENT Sdyn predicted this context from the last one;
@@ -230,21 +284,51 @@ end
 function _should_retrain(d::Driver, pending::Int, surprise)::Bool
     s = (surprise === nothing || !isfinite(surprise)) ? 0.0 : Float64(surprise)
     try
-        res = _SM.metta_run(_SM.parse_program("(should-retrain $pending $s)")[1][2], _learn_space(d))
+        res = _SM.metta_run(_SM.parse_program("(should-retrain $pending $s)")[1][2], _policy_space(d))
         return !isempty(res) && string(res[1]) == "True"
     catch
         return false
     end
 end
 
-# Lazily build the driver's learn-space: Core stdlib (for >=, or, > …) + the `should-retrain` rule. Cached
-# on the driver so the stdlib load is paid once, and only by drivers that actually learn.
-function _learn_space(d::Driver)
+# Lazily build the driver's POLICY space: Core stdlib (>=, and, not, if, arithmetic …) + the cadence rule +
+# the cognitive-control policy rules (appraise / action-success? / evidence->stv / initial-sense). Cached on
+# the driver so the stdlib load is paid ONCE, and only by drivers that actually evaluate policy.
+function _policy_space(d::Driver)
     if d.learn_space === nothing
         sp = _SM.Space()
         _SM.load_core_stdlib!(sp)
         _SM.load_metta!(sp, d.learn_rule)
+        _SM.load_metta!(sp, d.policy_rules)
         d.learn_space = sp
     end
     return d.learn_space
 end
+
+# Evaluate `expr` in the driver's policy space and marshal a `(head v1 v2 …)` result to a Float64 vector
+# (e.g. `(stimulus …)`, `(STV …)`); nothing on any parse/eval failure (callers fail safe to a native value).
+function _policy_vec(d::Driver, expr::AbstractString, head::AbstractString)
+    try
+        res = _SM.metta_run(_SM.parse_program(expr)[1][2], _policy_space(d))
+        isempty(res) && return nothing
+        m = match(Regex("\\(" * head * "\\s+([-0-9.eE ]+)\\)"), string(res[1]))
+        m === nothing ? nothing : [parse(Float64, t) for t in split(strip(m.captures[1]))]
+    catch
+        return nothing
+    end
+end
+
+# What COUNTS as a successful action — the `action-success?` MeTTa rule (fail-safe to the native predicate).
+function _action_success(d::Driver, decision, result)::Bool
+    dsym = decision === :allowed ? "allowed" : decision === :blocked ? "blocked" : "none"
+    err = result isa AbstractString && startswith(result, "ERROR")
+    try
+        res = _SM.metta_run(_SM.parse_program("(action-success? $dsym $(err ? "True" : "False"))")[1][2], _policy_space(d))
+        return !isempty(res) && string(res[1]) == "True"
+    catch
+        return decision === :allowed && !err
+    end
+end
+
+# The agent's prior affect disposition — the `initial-sense` rule (fail-safe to the neutral baseline).
+_initial_sense(d::Driver) = (v = _policy_vec(d, "(initial-sense)", "stimulus"); v === nothing ? [0.1, 0.5, 0.1, 0.3] : v)
