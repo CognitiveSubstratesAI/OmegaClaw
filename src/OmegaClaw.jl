@@ -47,6 +47,6 @@ export Proposal, Policy, Decision, Allow, Deny, RequireProbe, RequireReview, Def
     governed, register_ops!, register_capability!, register_probe!, PROBE_REGISTRY,
     DeferQueue, DEFER_QUEUE, defer!, drain_deferred!,
     DEFAULT_POLICY, DEFAULT_LEDGER,
-    Driver, seed!, step!
+    Driver, seed!, step!, reinforce!
 
 end # module OmegaClaw

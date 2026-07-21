@@ -121,6 +121,19 @@ using OmegaClaw
         @test governed(pp, Ledger(), "http-get", ["x"], _ -> "fetched") == "fetched"   # now runs (was Deny)
     end
 
+    @testset "reinforcement teaches action selection (B)" begin
+        strict = Policy(Set(["echo"]), Regex[], Regex[], Regex[], Regex[], "t", "t", true, false, nothing)
+        d = Driver(; store = mktempdir(), ledger = Ledger(), policy = strict)
+        seed!(d, "act-good", "task", "echo", ["good"])
+        seed!(d, "act-alt", "task", "echo", ["alt"])          # competing action for the SAME goal
+        for _ in 1:5; reinforce!(d, "act-good", "task", true); end   # succeeds
+        for _ in 1:5; reinforce!(d, "act-alt", "task", false); end   # fails/blocked
+        @test d.outcomes["act-good"] == (5, 5)
+        @test d.outcomes["act-alt"] == (0, 5)
+        sel = OmegaClaw.WorldModel.select_action(d.reg, "task")
+        @test !isempty(sel) && sel[1][1] == "act-good"        # PLN now prefers the reinforced-success action
+    end
+
     @testset "driver loop over WorldModel (capabilities)" begin
         # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) → translate
         # action → governed capability (exact argv, no shell) → recorded. Heavy (constructs a WorldModel).

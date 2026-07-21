@@ -22,6 +22,7 @@ mutable struct Driver
     policy::Union{Policy,Nothing}                         # nothing ⇒ read the LIVE DEFAULT_POLICY[] each tick (B6)
     ledger::Ledger
     actions::Dict{String,Tuple{String,Vector{String}}}   # action_id => (op_name, args)
+    outcomes::Dict{String,Tuple{Int,Int}}                # action_id => (successes, attempts) — reinforcement stats
     goal::Union{String,Nothing}
     governor::Any                                         # MetaMo (; goals,mods,stimulus,candidates) | nothing
 end
@@ -33,8 +34,27 @@ function Driver(; store::AbstractString = mktempdir(),
     WorldModel.seed_world_model!(reg)
     loop = WorldModel.CognitiveLoop(reg)
     return Driver(reg, loop, policy, ledger,
-        Dict{String,Tuple{String,Vector{String}}}(),
+        Dict{String,Tuple{String,Vector{String}}}(), Dict{String,Tuple{Int,Int}}(),
         goal === nothing ? nothing : String(goal), governor)
+end
+
+"""
+    reinforce!(d, action_id, goal, success; k=1) -> NamedTuple
+
+Update the `action_id ⇒ goal` PLN truth-value from an execution outcome (the reward channel): accumulate
+(successes, attempts) and re-assert the implication with strength = successes/attempts and confidence
+growing with evidence. So `select_action(goal)` prefers actions that have actually succeeded, and demotes
+actions that were blocked or errored. Re-uses WorldModel's own `assert_implication!` (no bespoke store).
+"""
+function reinforce!(d::Driver, action_id::AbstractString, goal::AbstractString, success::Bool; k::Int = 1)
+    s0, n0 = get(d.outcomes, String(action_id), (0, 0))
+    s1, n1 = s0 + (success ? 1 : 0), n0 + 1
+    d.outcomes[String(action_id)] = (s1, n1)
+    strength = s1 / n1
+    confidence = n1 / (n1 + k)                            # 0.5 at 1 attempt → 0.9 at 9
+    WorldModel.assert_implication!(d.reg, action_id, goal, strength, confidence, float(d.loop.tick))
+    return (; action = String(action_id), goal = String(goal), success = success,
+        strength = strength, confidence = confidence, attempts = n1)
 end
 
 "The policy this driver runs under this tick: an explicit pinned policy, else the LIVE default (B6)."
@@ -82,7 +102,7 @@ One agent tick. Returns `(; action, op, args, decision, result, mid)`; `decision
 nothing)`. `action === nothing` (no goal / no matching rule / unbound id) is a NORMAL "no action this tick".
 Feed `result` back as the next `raw` to close the loop.
 """
-function step!(d::Driver, raw::AbstractString; goal = d.goal)
+function step!(d::Driver, raw::AbstractString; goal = d.goal, reinforce::Bool = false)
     obs = _perceive(raw, d.loop.tick)
     r = WorldModel.mid_step!(d.loop, obs; goal = goal, governor = d.governor)
     r.action === nothing &&
@@ -94,5 +114,9 @@ function step!(d::Driver, raw::AbstractString; goal = d.goal)
     # live policy (honours a runtime reload, B6) + real op evidence for the TOCTOU snapshot (B5)
     result = governed(_live_policy(d), d.ledger, op, args, _OUTBOUND[op]; evidence = () -> _op_evidence(op, args))
     decision = startswith(result, "GATE[") ? :blocked : :allowed
+    if reinforce && r.goal isa AbstractString            # reward channel (opt-in): learn from the outcome
+        success = decision === :allowed && !startswith(result, "ERROR")
+        reinforce!(d, name, r.goal, success)
+    end
     return (; action = name, op = op, args = args, decision = decision, result = result, mid = r)
 end
