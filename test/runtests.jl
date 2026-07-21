@@ -350,6 +350,19 @@ using OmegaClaw
         @test r1.strength != r0.strength                     # same inputs, different policy ⇒ different STV
     end
 
+    @testset "pure-MeTTa tick loop drives grounded organs (run_metta_loop!)" begin
+        # The tick LOOP itself is a MeTTa tail-recursion (upstream-faithful), driving by-handle grounded Julia
+        # organs — WorldModel decides, the gate authorizes, the ledger records — none of the 1024-vec crosses
+        # the ABI. Proves the loop-in-MeTTa topology works end-to-end on Core's interpreter.
+        policy = Policy(Set(["echo", "write-file"]), Regex[], Regex[], Regex[], Regex[], "t", "t", true, false, nothing)
+        hut = joinpath(mktempdir(), "hut")
+        d = Driver(; store = mktempdir(), ledger = Ledger(), policy = policy)
+        seed_plan!(d, "shelter", [("gather", "echo", ["got-wood"]), ("build", "write-file", [hut, "built"])])
+        run_metta_loop!(d; goal = "shelter", max_turns = 2)      # the LOOP is MeTTa, not a Julia harness
+        @test isfile(hut)                                        # the gated 2-step plan executed via the MeTTa loop
+        @test verify_chain(d.ledger) && !isempty(d.ledger.entries)   # every decision recorded + chained
+    end
+
     @testset "driver loop over WorldModel (capabilities)" begin
         # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) → translate
         # action → governed capability (exact argv, no shell) → recorded. Heavy (constructs a WorldModel).

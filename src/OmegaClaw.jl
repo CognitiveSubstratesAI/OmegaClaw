@@ -30,6 +30,7 @@ include("GroundedOps.jl")
 include("Driver.jl")
 include("SdynTrain.jl")
 include("Channels.jl")
+include("MettaLoop.jl")
 
 # The live policy + ledger the registered ops run under. Set at load (__init__), from the external
 # manifest so the authority is not the agent's own code.
@@ -77,6 +78,7 @@ export Proposal, Policy, Decision, Allow, Deny, RequireProbe, RequireReview, Def
     DEFAULT_POLICY, DEFAULT_LEDGER,
     Driver, seed!, seed_plan!, step!, reinforce!,
     gather_transitions, train_sdyn!,
-    OmegaChannel, BufferChannel, CLIChannel, poll, emit, run_agent!
+    OmegaChannel, BufferChannel, CLIChannel, poll, emit, run_agent!,
+    run_metta_loop!, oc_handle!
 
 end # module OmegaClaw
