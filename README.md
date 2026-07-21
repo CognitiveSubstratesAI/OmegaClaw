@@ -1,0 +1,2 @@
+# OmegaClaw
+OmegaClaw metta agent 
