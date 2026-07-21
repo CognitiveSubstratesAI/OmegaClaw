@@ -159,6 +159,26 @@ using OmegaClaw
         @test res.last_energy < res.first_energy              # train energy dropped ⇒ Sdyn learned
     end
 
+    @testset "online learning, MeTTa-controlled cadence (D-online)" begin
+        # The retrain CADENCE is a MeTTa rule, not a Julia constant. Install a rule that fires at 3 pending
+        # transitions, drive the agent with learn=true, and verify Sdyn trained ONLINE: pending resets when
+        # the rule fires, surprise (forward-model prediction error) is measured, and predict_dynamics becomes
+        # a live finite forward model. Re-scheduling the agent's learning = editing this atom, no recompile.
+        d = Driver(; store = mktempdir(), ledger = Ledger(),
+            learn_rule = "(= (should-retrain \$n \$s) (>= \$n 3))")
+        inputs = ["a1", "b2", "c3", "d4", "e5", "f6", "g7", "h8"]
+        surprises = Float64[]
+        for raw in inputs
+            r = step!(d, raw; learn = true, hidden = 16, epochs = 40)
+            r.surprise !== nothing && push!(surprises, r.surprise)
+        end
+        @test length(d.transitions) == length(inputs) - 1     # every transition buffered (organ memory)
+        @test d.pending < 3                                   # rule fired ⇒ pending was reset below threshold
+        @test !isempty(surprises) && all(isfinite, surprises) # forward model produced predictions once trained
+        pred = OmegaClaw.WorldModel.predict_dynamics(d.reg, d.transitions[end][1])
+        @test pred !== nothing && all(isfinite, pred)         # Sdyn is a live, finite forward model post-train
+    end
+
     @testset "driver loop over WorldModel (capabilities)" begin
         # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) → translate
         # action → governed capability (exact argv, no shell) → recorded. Heavy (constructs a WorldModel).
