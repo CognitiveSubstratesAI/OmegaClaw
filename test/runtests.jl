@@ -179,6 +179,108 @@ using OmegaClaw
         @test pred !== nothing && all(isfinite, pred)         # Sdyn is a live, finite forward model post-train
     end
 
+    @testset "keyed chain defeats re-forge (B10)" begin
+        # With a trust key the chain links are HMAC, so an attacker who rewrites entries and recomputes a
+        # valid *unkeyed* sha256 chain (the B10 re-forge) is rejected — they cannot produce the HMAC.
+        withenv("OMEGACLAW_TRUST_KEY" => "k"^40, "OMEGACLAW_TRUST_KEYFILE" => nothing) do
+            led = Ledger()
+            e = record!(led, Proposal("shell", ["echo a"]), Allow)
+            @test verify_chain(led)                       # keyed verify passes
+            @test verify_ledger(led)                      # in-memory ⇒ head_ok true (no path)
+            # forge: swap in the sha256 hash a keyless attacker WOULD compute over the same fields
+            sha = OmegaClaw._entry_hash(nothing, e.seq, e.proposal_hash, e.action, e.args, e.actor,
+                e.decision, e.policy_version, e.evidence_snapshot, e.expiry, e.receipt, e.timestamp, nothing)
+            @test sha != e.entry_hash                     # keyed ≠ unkeyed hash of the same content
+            led.entries[1] = LedgerEntry(e.seq, e.proposal_hash, e.action, e.args, e.actor, e.decision,
+                e.policy_version, e.evidence_snapshot, e.expiry, e.receipt, e.timestamp, e.prev_hash, sha)
+            @test !verify_chain(led)                      # the unkeyed (forgeable) hash is rejected — B10 closed
+        end
+    end
+
+    @testset "persisted reload + verify + anchored head (B7/B10)" begin
+        withenv("OMEGACLAW_TRUST_KEY" => "s"^40, "OMEGACLAW_TRUST_KEYFILE" => nothing) do
+            dir = mktempdir(); path = joinpath(dir, "ledger.jsonl")
+            led = Ledger(; path = path)
+            for i in 1:4; record!(led, Proposal("shell", ["echo $i"]), Allow); end
+            @test isfile(path) && isfile(path * ".head")  # entries + co-located head anchor persisted
+            r = load_ledger(path)                         # B7: reload from disk + verify
+            @test r.n == 4 && r.chain_ok && r.head_ok && r.authenticated
+            # tail-truncation: drop the last entry line (the chain alone can't notice — each remaining link is valid)
+            lines = readlines(path); write(path, join(lines[1:end - 1], "\n") * "\n")
+            r2 = load_ledger(path)
+            @test r2.n == 3 && r2.chain_ok                # remaining 3 are internally consistent…
+            @test !r2.head_ok                             # …but the keyed head anchor pins count:tip=4 ⇒ truncation caught
+            # on-disk field tamper (action shell→rm) leaves the stored HMAC unchanged ⇒ keyed reload rejects
+            forged = replace(readlines(path)[1], "\"action\":\"shell\"" => "\"action\":\"rm\"")
+            write(path, forged * "\n")
+            @test !load_ledger(path).chain_ok
+        end
+    end
+
+    @testset "shadow mode: unkeyed sha256 chain unchanged (no trust key)" begin
+        withenv("OMEGACLAW_TRUST_KEY" => nothing, "OMEGACLAW_TRUST_KEYFILE" => nothing) do
+            led = Ledger()
+            record!(led, Proposal("shell", ["echo a"]), Allow)
+            record!(led, Proposal("shell", ["echo b"]), Deny)
+            @test verify_chain(led) && verify_ledger(led) # plain sha256 tamper-evidence still holds
+            r = load_ledger(joinpath(mktempdir(), "absent.jsonl"))
+            @test r.n == 0 && r.chain_ok && r.head_ok && !r.authenticated
+        end
+    end
+
+    @testset "fix-review fixes: truncate-to-empty / deletion / :locked / downgrade / crash-window" begin
+        K = "z"^40
+        # (1) CRITICAL: truncate-to-empty must NOT pass — the surviving .head pins count>0
+        withenv("OMEGACLAW_TRUST_KEY" => K, "OMEGACLAW_TRUST_KEYFILE" => nothing) do
+            dir = mktempdir(); path = joinpath(dir, "l.jsonl")
+            led = Ledger(; path = path)
+            for i in 1:4; record!(led, Proposal("shell", ["e$i"]), Allow); end
+            write(path, "")                                    # attacker wipes the log, leaves .head
+            @test load_ledger(path).n == 0
+            @test !load_ledger(path).head_ok                   # truncation-to-empty caught (was the critical false-accept)
+        end
+        # (2) HIGH: DELETING the ledger file (leaving .head) is caught — not silently started fresh+unlocked (F1)
+        withenv("OMEGACLAW_TRUST_KEY" => K, "OMEGACLAW_TRUST_KEYFILE" => nothing) do
+            dir = mktempdir(); path = joinpath(dir, "l.jsonl")
+            led = Ledger(; path = path)
+            for i in 1:3; record!(led, Proposal("shell", ["e$i"]), Allow); end
+            rm(path)                                           # `rm ledger.jsonl`, .head survives
+            @test !load_ledger(path).head_ok                   # deletion caught by the keyed marker
+            @test load_ledger(joinpath(mktempdir(), "fresh.jsonl")).head_ok   # genuine first run still passes
+        end
+        # (3) HIGH: a configured-but-unresolvable (:locked) key fails CLOSED, never silently sha256
+        withenv("OMEGACLAW_TRUST_KEY" => K, "OMEGACLAW_TRUST_KEYFILE" => nothing) do
+            dir = mktempdir(); path = joinpath(dir, "l.jsonl")
+            led = Ledger(; path = path)
+            for i in 1:3; record!(led, Proposal("shell", ["e$i"]), Allow); end
+            withenv("OMEGACLAW_TRUST_KEYFILE" => joinpath(dir, "gone.key"), "OMEGACLAW_TRUST_KEY" => nothing) do
+                r = load_ledger(path)                          # _trust_key() == :locked
+                @test !r.chain_ok && !r.head_ok && !r.authenticated
+            end
+        end
+        # (4) HIGH: keyed→shadow downgrade — a present .head is the keyed marker; verifying keyless must fail
+        withenv("OMEGACLAW_TRUST_KEY" => K, "OMEGACLAW_TRUST_KEYFILE" => nothing) do
+            dir = mktempdir(); path = joinpath(dir, "l.jsonl")
+            led = Ledger(; path = path)
+            for i in 1:3; record!(led, Proposal("shell", ["e$i"]), Allow); end
+            withenv("OMEGACLAW_TRUST_KEY" => nothing, "OMEGACLAW_TRUST_KEYFILE" => nothing) do
+                @test !load_ledger(path).head_ok               # shadow verify of a keyed ledger ⇒ rejected
+            end
+        end
+        # (5) crash-window (F3): a head lagging by EXACTLY one over a chain-valid tail is a torn write ⇒
+        #     tolerated (no brick); lagging by two ⇒ not a single crash ⇒ rejected
+        withenv("OMEGACLAW_TRUST_KEY" => K, "OMEGACLAW_TRUST_KEYFILE" => nothing) do
+            dir = mktempdir(); path = joinpath(dir, "l.jsonl")
+            led = Ledger(; path = path)
+            for i in 1:3; record!(led, Proposal("shell", ["e$i"]), Allow); end
+            es = load_ledger(path).ledger.entries; key = Vector{UInt8}(codeunits(K))
+            write(path * ".head", bytes2hex(OmegaClaw._head_mac(key, 2, es[2].entry_hash)))  # crash: e3 written, head at 2
+            @test load_ledger(path).head_ok                    # torn-tail (lag by one) tolerated
+            write(path * ".head", bytes2hex(OmegaClaw._head_mac(key, 1, es[1].entry_hash)))  # head lags by two
+            @test !load_ledger(path).head_ok                   # not a single torn write ⇒ rejected
+        end
+    end
+
     @testset "driver loop over WorldModel (capabilities)" begin
         # The full agent tick on the REAL 14-Space braid: perceive → mid_step! (PLN decides) → translate
         # action → governed capability (exact argv, no shell) → recorded. Heavy (constructs a WorldModel).
