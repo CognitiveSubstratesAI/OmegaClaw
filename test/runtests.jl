@@ -377,6 +377,16 @@ using OmegaClaw
         @test OmegaClaw._SLOW_FIRES[] == 0                    # cadence not due
         OmegaClaw._SLOW_FIRES[] = 0; run_metta_loop!(mk(); goal = "task", max_turns = 16)
         @test OmegaClaw._SLOW_FIRES[] == 2                    # fired at ticks 8 and 16
+        # (a2) CHUNKED + CROSS-LANE continuity: the loop marshals its final cadence state back onto the driver,
+        # so N ticks split across calls behave like N ticks in one call, and MeTTa-lane ticks are visible to the
+        # step!/run_agent! lane. (Regression: the seed was read on entry and dropped on exit, so chunked driving
+        # silently restarted the counter and the ACTIVITY trigger never fired — 16 chunked ticks gave 0 fires.)
+        OmegaClaw._SLOW_FIRES[] = 0; dchunk = mk()
+        for _ in 1:4; run_metta_loop!(dchunk; goal = "task", max_turns = 4); end
+        @test OmegaClaw._SLOW_FIRES[] == 2                   # 4×4 ticks ≡ 1×16 ticks
+        dmix = mk(); run_metta_loop!(dmix; goal = "task", max_turns = 7)
+        @test dmix.slow_pending == 7                         # MeTTa-lane ticks visible to the step! lane
+        @test step!(dmix, "start"; goal = "task", ambient = true).slow !== nothing   # ⇒ the 8th real tick fires
         # (b) step! (Julia-harness path) returns the slow_step! summary on the tick it fires
         d2 = mk(); slow_ticks = Int[]
         for i in 1:8
@@ -386,10 +396,50 @@ using OmegaClaw
         @test slow_ticks == [8]                              # the K=8 cadence, in step!
         # (c) the cadence is an EDITABLE MeTTa rule, not a Julia constant — re-schedule to K=3
         d3 = Driver(; store = mktempdir(), ledger = Ledger(), policy = pol,
-                    consolidate_rule = "(= (should-consolidate \$n) (>= \$n 3))")
+                    consolidate_rule = "(= (should-consolidate \$n \$dt) (>= \$n 3))")
         seed!(d3, "greet", "task", "echo", ["hi"])
         OmegaClaw._SLOW_FIRES[] = 0; run_metta_loop!(d3; goal = "task", max_turns = 6)
         @test OmegaClaw._SLOW_FIRES[] == 2                    # K=3 ⇒ fired at ticks 3 and 6
+    end
+
+    @testset "ambient IDLE trigger — wall-clock self-wake (§7)" begin
+        # The second ambient trigger, OR'd with the tick counter: consolidate after T seconds even when the
+        # agent is IDLE (few/no ticks). Upstream (mettaclaw/OmegaClaw-Core) re-arms a `&nextWakeAt` mutable
+        # cell on a get_time deadline; ours reads the clock via the `oc-now` organ and threads the last-fire
+        # timestamp as a LOOP PARAM (`$t0`) — no mutable state cell (the idiom PeTTa's stdlib uses).
+        pol = Policy(Set(["echo"]), Regex[], Regex[], Regex[], Regex[], "t", "t", true, false, nothing)
+        # idle-secs = 0 ⇒ the wall-clock branch is ALWAYS due ⇒ fires every tick even though K=999 never is.
+        mkd(rule) = (dd = Driver(; store = mktempdir(), ledger = Ledger(), policy = pol, consolidate_rule = rule);
+                     seed!(dd, "greet", "task", "echo", ["hi"]); dd)
+        idle_now = "(= (should-consolidate \$n \$dt) (or (>= \$n 999) (>= \$dt 0)))"
+        OmegaClaw._SLOW_FIRES[] = 0; run_metta_loop!(mkd(idle_now); goal = "task", max_turns = 3)
+        @test OmegaClaw._SLOW_FIRES[] == 3                    # idle branch fired every tick (tick branch never)
+        # the tick branch alone must NOT fire it — proves the 3 above came from $dt, not $n
+        idle_never = "(= (should-consolidate \$n \$dt) (or (>= \$n 999) (>= \$dt 99999)))"
+        OmegaClaw._SLOW_FIRES[] = 0; run_metta_loop!(mkd(idle_never); goal = "task", max_turns = 3)
+        @test OmegaClaw._SLOW_FIRES[] == 0
+        # $dt is real elapsed WALL time, not a tick count: after sleeping past a 0.3s threshold, one tick fires.
+        d = mkd("(= (should-consolidate \$n \$dt) (or (>= \$n 999) (>= \$dt 0.3)))")
+        step!(d, "start"; goal = "task", ambient = true)       # warm-up tick: JIT for mid_step!/perceive costs
+        d.last_slow = time()                                  # …>0.3s, so start the measured interval cleanly
+        r1 = step!(d, "start"; goal = "task", ambient = true)
+        @test r1.slow === nothing                             # ~0s elapsed ⇒ not due
+        sleep(0.35)
+        r2 = step!(d, "start"; goal = "task", ambient = true)
+        @test r2.slow !== nothing                             # elapsed > 0.3s ⇒ idle trigger fired
+        # firing RESETS the wall clock, so the very next tick is not due again
+        @test step!(d, "start"; goal = "task", ambient = true).slow === nothing
+        # (d) idle SELF-WAKE in run_agent!: an exhausted channel consolidates instead of dying with work
+        # pending. `last_slow` is the observable — _ambient_step! stamps it BEFORE doing the (best-effort)
+        # work, so it proves the wake PATH ran regardless of what the organ returns.
+        d4 = mkd(idle_now); before4 = d4.last_slow
+        n4 = run_agent!(d4, BufferChannel(String[]); goal = "task", ambient = true)   # no input at all ⇒ idle
+        @test n4 == 0                                         # zero turns…
+        @test d4.last_slow > before4                          # …but the idle wake DID consolidate
+        # and it is strictly OPT-IN: same empty channel, ambient=false ⇒ no ambient work at all
+        d5 = mkd(idle_now); before5 = d5.last_slow
+        run_agent!(d5, BufferChannel(String[]); goal = "task", ambient = false)
+        @test d5.last_slow == before5
     end
 
     @testset "driver loop over WorldModel (capabilities)" begin

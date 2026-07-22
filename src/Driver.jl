@@ -21,11 +21,23 @@ selection; a `governor` ⇒ MetaMo picks the goal (leave `goal=nothing`).
 # line: the numeric organ (FabricPC train / surprise-norm) is grounded Julia, but the control policy is MeTTa.
 const DEFAULT_LEARN_RULE = "(= (should-retrain \$n \$s) (>= \$n 8))"   # surprise-aware form: (or (>= \$n 8) (> \$s θ))
 
-# The AMBIENT/SLOW-rate cadence (whitepaper §7 ambient background loop): how often WorldModel.slow_step! runs —
+# The AMBIENT/SLOW-rate cadence (whitepaper §7 ambient background loop): when WorldModel.slow_step! runs —
 # the SAME editable-atom idiom as `should-retrain` above and Core/lib ECAN's `scan-due?` (counter ≥ interval),
-# so *how often the agent consolidates in the background* is a rewritable policy atom, not a Julia constant.
-# K=8 by default (the slow rate is rate-limited vs the per-tick mid rate); tune the rule to reschedule.
-const DEFAULT_CONSOLIDATE_RULE = "(= (should-consolidate \$n) (>= \$n 8))"
+# so *when the agent consolidates in the background* is a rewritable policy atom, not a Julia constant.
+#
+# TWO triggers, OR'd — the union of an ACTIVITY clock and a WALL clock:
+#   · `$n`  = mid-ticks since the last ambient step  ⇒ consolidate every K ticks while the agent is BUSY.
+#   · `$dt` = wall-clock SECONDS since the last ambient step ⇒ consolidate after T seconds even when the agent
+#             is IDLE (few/no ticks). This is the upstream self-wake semantic (mettaclaw/OmegaClaw-Core re-arm
+#             `&nextWakeAt` on a `get_time` deadline) — but WITHOUT their host-side mutable state cell: we read
+#             the clock via the `oc-now` numeric organ and thread the last-fire timestamp as a LOOP PARAM, the
+#             idiom PeTTa's own stdlib uses (`iterate`) and the one PeTTa flags mutable cells as hazardous against.
+# Both thresholds are separate named atoms so either can be retuned (or the whole predicate rewritten) at runtime.
+const DEFAULT_CONSOLIDATE_RULE = raw"""
+(= (consolidate-every) 8)
+(= (consolidate-idle-secs) 600)
+(= (should-consolidate $n $dt) (or (>= $n (consolidate-every)) (>= $dt (consolidate-idle-secs))))
+"""
 
 # The agent's cognitive-control POLICY, as MeTTa rules (inspectable + rewritable atoms), NOT Julia constants —
 # the same MeTTa-First line as the cadence rule above (verified: the ecosystem — mettaclaw/CeTTa/PeTTa —
@@ -62,6 +74,7 @@ mutable struct Driver
     prev_context::Union{Vector{Float64},Nothing}         # last tick's context vector (to form a transition)
     pending::Int                                          # transitions since the last retrain (fed to the rule)
     slow_pending::Int                                     # mid-ticks since the last ambient/slow step (fed to should-consolidate)
+    last_slow::Float64                                    # wall-clock (s) of the last ambient step — drives the IDLE trigger ($dt)
     learn_rule::String                                   # MeTTa `should-retrain` cadence rule (editable = re-schedule)
     consolidate_rule::String                             # MeTTa `should-consolidate` cadence rule (ambient/slow rate — editable)
     policy_rules::String                                 # MeTTa cognitive-control policy (appraise/action-success?/evidence->stv/…) — rewritable
@@ -85,7 +98,8 @@ function Driver(; store::AbstractString = mktempdir(),
     loop = WorldModel.CognitiveLoop(reg)
     return Driver(reg, loop, policy, ledger,
         Dict{String,Tuple{String,Vector{String}}}(), Dict{String,Tuple{Int,Int}}(),
-        Tuple{Vector{Float64},Vector{Float64}}[], nothing, 0, 0, String(learn_rule), String(consolidate_rule), String(policy_rules), nothing,
+        Tuple{Vector{Float64},Vector{Float64}}[], nothing, 0, 0, time(),   # last_slow: idle clock starts at construction
+        String(learn_rule), String(consolidate_rule), String(policy_rules), nothing,
         goal === nothing ? nothing : String(goal), governor,
         Dict{String,Vector{String}}(), String[], 0,
         Float64[], 0.0)   # sense: empty ⇒ lazily initialized from the `(initial-sense)` MeTTa rule on first adaptive tick
@@ -251,9 +265,9 @@ function step!(d::Driver, raw::AbstractString; goal = d.goal, reinforce::Bool = 
     slow = nothing
     if ambient
         d.slow_pending += 1
-        if _should_consolidate(d, d.slow_pending)      # ← the MeTTa cadence rule decides (editable), not a constant
+        # BOTH triggers OR'd in MeTTa: ticks-since ($n) and wall-clock seconds-since ($dt, the idle trigger).
+        if _should_consolidate(d, d.slow_pending, time() - d.last_slow)   # ← the MeTTa rule decides, not a constant
             slow = _ambient_step!(d)
-            d.slow_pending = 0
         end
     end
     return (; action = name, op = op, args = args, decision = decision, result = result,
@@ -314,16 +328,25 @@ end
 # MOSES/GEO-EVO `geo_synthesize!` → Sprog. Rate-limited by the `should-consolidate` MeTTa cadence atom (same
 # idiom as `should-retrain`). `t = loop.tick` is the monotonic belief-decay time (mid_step! advances it). Fail-
 # safe: the ambient step is best-effort background work — a failure never breaks the agent's goal-directed tick.
-function _should_consolidate(d::Driver, n::Int)::Bool
+# `n` = mid-ticks since the last ambient step; `dt` = wall-clock SECONDS since it (the idle trigger). A
+# non-finite/negative dt is clamped to 0.0 so only the tick branch can fire on a bad clock reading.
+function _should_consolidate(d::Driver, n::Int, dt::Real = 0.0)::Bool
+    s = (dt === nothing || !isfinite(dt) || dt < 0) ? 0.0 : Float64(dt)
     try
-        res = _SM.metta_run(_SM.parse_program("(should-consolidate $n)")[1][2], _policy_space(d))
+        res = _SM.metta_run(_SM.parse_program("(should-consolidate $n $s)")[1][2], _policy_space(d))
         return !isempty(res) && string(res[1]) == "True"
     catch
         return false
     end
 end
 
+# Fire one ambient/slow step and RESET BOTH cadence clocks (tick counter + wall clock). Every path that
+# consolidates goes through here — the tick cadence, and the idle self-wake in run_agent! — so the two
+# triggers can never drift apart. Best-effort: a failure never breaks the agent's goal-directed tick, but
+# the clocks still reset so a persistently-failing organ can't spin every tick.
 function _ambient_step!(d::Driver)
+    d.slow_pending = 0
+    d.last_slow = time()
     try
         return WorldModel.slow_step!(d.loop; t = Float64(d.loop.tick))
     catch

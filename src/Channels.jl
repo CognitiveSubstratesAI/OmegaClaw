@@ -45,12 +45,21 @@ The interactive agent loop: poll the channel → `step!` the driver (perceive �
 optional reinforce) → emit the result. Runs until the channel is exhausted or `max_turns`. Returns the
 number of turns taken.
 """
-function run_agent!(d::Driver, ch::OmegaChannel; goal = d.goal, reinforce::Bool = false, max_turns::Int = 100)
+function run_agent!(d::Driver, ch::OmegaChannel; goal = d.goal, reinforce::Bool = false,
+    ambient::Bool = false, max_turns::Int = 100)
     turns = 0
     while turns < max_turns
         input = poll(ch)
-        input === nothing && break
-        r = step!(d, input; goal = goal, reinforce = reinforce)
+        if input === nothing
+            # IDLE SELF-WAKE (§7 ambient loop): there is no input to react to, so spend the idle moment on
+            # background maintenance instead of exiting with consolidation still pending. Upstream
+            # (mettaclaw/OmegaClaw-Core) does the same on a `get_time` deadline once its per-message budget
+            # empties; here the decision is the SAME editable MeTTa `should-consolidate` rule the tick cadence
+            # uses — so "consolidate when idle" is policy ($dt ≥ idle-secs), not a hardcoded flush-on-exit.
+            ambient && _should_consolidate(d, d.slow_pending, time() - d.last_slow) && _ambient_step!(d)
+            break
+        end
+        r = step!(d, input; goal = goal, reinforce = reinforce, ambient = ambient)
         emit(ch, r.result === nothing ? "(no action for goal)" : r.result)
         turns += 1
     end
