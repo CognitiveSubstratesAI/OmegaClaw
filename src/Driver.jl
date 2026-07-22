@@ -135,8 +135,13 @@ goal)` + a belief so `select_action(reg, goal)` returns `action_id` (1-hop), and
 outbound op. `action_id` must be whitespace-free and contain no `=>` (belief-key parse). `op` must be a
 registered outbound op (`shell`, `read-file`).
 """
+# `t = -1.0` (NOT 0.0): a seed is a PRIOR and must precede every observation. Beliefs resolve
+# latest-wins by `t` (see Beliefs.beliefs), and reinforce! stamps `t = d.loop.tick` — which is still
+# 0.0 until the loop actually ticks. Sharing t=0.0 let the seed's optimistic c=0.9 outrank real
+# evidence (5/6 = 0.833), freezing selection on the prior for a FAILING action just as much as a
+# succeeding one. A prior is superseded by the first real observation, by construction.
 function seed!(d::Driver, action_id::AbstractString, goal::AbstractString,
-    op::AbstractString, args::Vector{String}; s::Real = 0.9, c::Real = 0.9, t::Real = 0.0)
+    op::AbstractString, args::Vector{String}; s::Real = 0.9, c::Real = 0.9, t::Real = -1.0)
     (occursin(r"\s", action_id) || occursin("=>", action_id)) &&
         error("action_id must be whitespace-free and contain no '=>': $action_id")
     haskey(_OUTBOUND, String(op)) ||
