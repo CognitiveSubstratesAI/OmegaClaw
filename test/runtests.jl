@@ -331,9 +331,46 @@ using OmegaClaw
     @testset "cognitive-control policy is a rewritable MeTTa atom (not hardcoded Julia)" begin
         # The reward estimator (count→STV) is a MeTTa rule; override it per-driver ⇒ different behavior,
         # proving it's an inspectable/rewritable atom, not a Julia constant.
+        #
+        # THIS TESTSET USED TO BE UNFALSIFIABLE. Its only default-path assertion was
+        # `r0.strength ≈ 1.0 && r0.confidence ≈ 0.5`, and `reinforce!` fell back to a Julia twin
+        # `(s1/n1, n1/(n1+k))` whenever the rule failed to evaluate — which at s=n=k=1 yields exactly
+        # (1.0, 0.5). So DELETING the MeTTa rule left the testset green: it proved the numbers, never the
+        # lane. A reflective audit of the changed surface caught it. The three checks below each fail for
+        # a different reason if the delegation regresses.
         d0 = Driver(; store = mktempdir(), ledger = Ledger())
-        r0 = reinforce!(d0, "a", "g", true)                  # default evidence->stv: strength=s/n, conf=n/(n+k)
-        @test r0.strength ≈ 1.0 && r0.confidence ≈ 0.5       # 1/1, 1/(1+1)
+        r0 = reinforce!(d0, "a", "g", true)                  # default evidence->stv: strength=s/n, conf=Truth_w2c(n/k)
+        @test r0.strength ≈ 1.0 && r0.confidence ≈ 0.5       # 1/1, w2c(1/1)=0.5
+
+        # (i) the MeTTa lane actually PRODUCED that value — not the (now-removed) Julia fallback
+        @test OmegaClaw._policy_vec(d0, "(evidence->stv 1 1 1)", "STV") !== nothing
+
+        # (ii) …and a policy MISSING the rule must now RAISE, not silently substitute Julia numbers.
+        #      This is the assertion the old testset could not express, because failure was invisible.
+        no_estimator = raw"""
+        (= (novelty-decay) 0.9)
+        (= (effort-baseline) 0.3)
+        (= (initial-sense) (stimulus 0.1 0.5 0.1 0.3))
+        (= (action-success? $d $e) (and (== $d allowed) (not $e)))
+        """
+        dbad = Driver(; store = mktempdir(), ledger = Ledger(), policy_rules = no_estimator)
+        @test_throws ArgumentError reinforce!(dbad, "a", "g", true)
+
+        # (iii) the confidence half DELEGATES to Core/lib/pln rather than re-deriving n/(n+k). Agreement
+        #       with the canonical map across a range — an independent Julia copy would have to be kept
+        #       in sync by hand, which is precisely the failure this whole audit was about.
+        w2c(n) = begin
+            sp = MeTTaCore.Interpreter.Space()
+            MeTTaCore.Interpreter.load_core_stdlib!(sp)
+            MeTTaCore.Interpreter.load_metta!(sp, "!(import! &self \"$(OmegaClaw._LIBPLN_ENTRY)\")")
+            parse(Float64, strip(string(MeTTaCore.Interpreter.load_metta!(sp, "!(Truth_w2c $n)")[1])))
+        end
+        for n in 1:4
+            dn = Driver(; store = mktempdir(), ledger = Ledger())
+            local rn
+            for _ in 1:n; rn = reinforce!(dn, "a", "g", true); end
+            @test rn.confidence ≈ w2c(n)                     # k = 1 ⇒ EvidenceConfidence(n/1) = Truth_w2c(n)
+        end
         # a custom policy that Laplace-smooths strength (s+1)/(n+2) — same rules, one line changed
         custom = raw"""
         (= (novelty-decay) 0.9)

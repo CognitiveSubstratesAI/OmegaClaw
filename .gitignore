@@ -10,5 +10,9 @@ Manifest.toml
 *.act
 *.ledger.jsonl
 
+# Warm dev session runtime (tools/warm_session.jl ↔ tools/warm_send.sh handshake files:
+# ready/seq/done/in.jl/out.txt). Process-local scratch, never source. Mirrors Core/.gitignore:102.
+.warm/
+
 # OS
 .DS_Store

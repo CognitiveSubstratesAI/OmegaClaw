@@ -9,6 +9,12 @@
 
 import WorldModel
 
+# The canonical PLN library's ENTRY POINT, loaded into every driver's policy space (see `_policy_space`)
+# so the agent's cognitive-control rules can DELEGATE to `Truth_w2c`/`EvidenceConfidence` instead of
+# re-deriving them. Resolved from the installed MeTTaCore rather than a relative path, exactly as
+# `WorldModel/src/PLNCore.jl` does — one library, one location, no vendored copy in this repo.
+const _LIBPLN_ENTRY = abspath(joinpath(dirname(pathof(MeTTaCore)), "..", "lib", "pln", "pln.metta"))
+
 """
     Driver(; store, policy, ledger, goal=nothing, governor=nothing)
 
@@ -48,6 +54,17 @@ const DEFAULT_CONSOLIDATE_RULE = raw"""
 # `action-success?` : what COUNTS as a successful action (drives the stimulus, plan-advance, and reward).
 # `evidence->stv`   : the reward-outcome → PLN truth-value estimator (frequency + count→confidence, k = PLN
 #               look-ahead). `initial-sense` : the agent's prior affect disposition.
+#
+# The confidence half DELEGATES to `Core/lib/pln`'s `EvidenceConfidence` (= the canonical `Truth_w2c`,
+# k = 1) instead of writing `(/ $n (+ $n $k))` out again. That inline form was a SECOND MeTTa COPY of
+# pln_core_logic.metta:214-216 — and, because `_policy_space` used to load only the Core stdlib (which
+# contains no `Truth_w2c`), it was a copy that structurally COULD NOT delegate. Being MeTTa is not the
+# property that matters; being the SAME definition is. `EvidenceConfidence (/safe $n $k)` is exactly
+# equal to `n/(n+k)` for every k > 0 — w2c(n/k) = (n/k)/((n/k)+1) = n/(n+k) — so the k look-ahead
+# parameter survives intact while the confidence MAP has one definition. At the shipped k = 1 it is the
+# canonical map applied directly, which is what puts these confidences on the same evidence scale as
+# every other truth value in the system (and is why PeTTaChainer's k = 800 must not be imported).
+# `/safe` also replaces bare `/`: n = 0 now prunes rather than emitting NaN.
 const DEFAULT_POLICY_RULES = raw"""
 (= (novelty-decay) 0.9)
 (= (effort-baseline) 0.3)
@@ -60,7 +77,7 @@ const DEFAULT_POLICY_RULES = raw"""
              (if $success 0.8 0.2)
              (if $blocked 0.8 0.1)
              (effort-baseline)))
-(= (evidence->stv $s $n $k) (STV (/ $s $n) (/ $n (+ $n $k))))
+(= (evidence->stv $s $n $k) (STV (/safe $s $n) (EvidenceConfidence (/safe $n $k))))
 """
 
 mutable struct Driver
@@ -117,8 +134,11 @@ function reinforce!(d::Driver, action_id::AbstractString, goal::AbstractString, 
     s0, n0 = get(d.outcomes, String(action_id), (0, 0))
     s1, n1 = s0 + (success ? 1 : 0), n0 + 1
     d.outcomes[String(action_id)] = (s1, n1)              # counter accumulation = native bookkeeping
-    stv = _policy_vec(d, "(evidence->stv $s1 $n1 $k)", "STV")   # count→STV estimator = MeTTa policy (fail-safe native)
-    strength, confidence = stv === nothing ? (s1 / n1, n1 / (n1 + k)) : (stv[1], stv[2])
+    # count→STV estimator = MeTTa policy. REQUIRED: there is deliberately no Julia fallback here. The
+    # previous `stv === nothing ? (s1/n1, n1/(n1+k)) : …` was a third copy of the canonical count→
+    # confidence map (at k=1, `n/(n+k)` IS `Truth_w2c`) that took over invisibly whenever the rule failed.
+    stv = _policy_vec_req(d, "(evidence->stv $s1 $n1 $k)", "STV", "evidence->stv")
+    strength, confidence = stv[1], stv[2]
     WorldModel.assert_implication!(d.reg, action_id, goal, strength, confidence, float(d.loop.tick))
     return (; action = String(action_id), goal = String(goal), success = success,
         strength = strength, confidence = confidence, attempts = n1)
@@ -366,6 +386,13 @@ function _policy_space(d::Driver)
     if d.learn_space === nothing
         sp = _SM.Space()
         _SM.load_core_stdlib!(sp)
+        # …and the canonical PLN library, so policy rules can DELEGATE to `Truth_w2c`/`EvidenceConfidence`
+        # rather than re-deriving them. Without this the space held only stdlib.metta + CoreExtensions.metta
+        # (neither of which defines `Truth_w2c`), so `evidence->stv` had no canonical formula in scope and
+        # was forced to spell the confidence map out again — a second copy that could not be collapsed.
+        # Loaded through `pln.metta`, the library's own ENTRY POINT, so this space gets whatever the library
+        # exports rather than a hand-picked subset that can drift from it.
+        _SM.load_metta!(sp, "!(import! &self \"$(_LIBPLN_ENTRY)\")")
         _SM.load_metta!(sp, d.learn_rule)
         _SM.load_metta!(sp, d.consolidate_rule)
         _SM.load_metta!(sp, d.policy_rules)
@@ -385,6 +412,26 @@ function _policy_vec(d::Driver, expr::AbstractString, head::AbstractString)
     catch
         return nothing
     end
+end
+
+# Same, for a policy rule the agent CANNOT run without. Fails LOUD instead of failing SAME.
+#
+# `_policy_vec` collapses "the rule is missing", "it threw", and "it returned a shape I don't recognise"
+# all into `nothing`, and each caller then substituted a hand-written Julia twin of the very formula that
+# just failed. That makes a rewritable atom UNREWRITABLE-OUT: a MOSES/GEO-EVO edit that renames the
+# constructor or leaves a term unreduced silently reverts the agent to the original numbers with zero
+# signal — and, because the twin was numerically identical on the default inputs, the test that claimed to
+# prove "policy is a MeTTa atom, not hardcoded Julia" passed with the MeTTa rule DELETED.
+# A truth value written into the metagraph from a hardcoded Julia constant, while the policy that was
+# supposed to produce it is broken, is worse than stopping. So: stop, and say which rule.
+function _policy_vec_req(d::Driver, expr::AbstractString, head::AbstractString, rule::AbstractString)
+    v = _policy_vec(d, expr, head)
+    v === nothing && throw(ArgumentError(
+        "OmegaClaw policy rule `$rule` did not yield a `($head …)` for `$expr`. The cognitive-control " *
+        "policy is a required MeTTa atom — it has no Julia substitute. Check the `policy_rules` this " *
+        "driver was built with (a rewrite that renames the constructor or leaves a term unreduced lands " *
+        "here), or that `Core/lib/pln` loaded (`$(_LIBPLN_ENTRY)`)."))
+    return v
 end
 
 # What COUNTS as a successful action — the `action-success?` MeTTa rule (fail-safe to the native predicate).
