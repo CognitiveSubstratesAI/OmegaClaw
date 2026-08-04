@@ -1,5 +1,14 @@
 using Test
 using OmegaClaw
+# PRE-EXISTING BREAK, fixed 2026-08-04: the w2c testset (:368-371) calls `MeTTaCore.Interpreter.*`,
+# but `using MeTTaCore` INSIDE the OmegaClaw module does not bind the name `MeTTaCore` in Main — so
+# that testset raised UndefVarError on every run, independently of any change here.
+import MeTTaCore
+
+# The PN-counter CRDT — WP §2.6 Eq. 1. Wired FIRST and unconditionally: a test that is not included
+# is worse than a missing one, because the suite then reports coverage it does not have (this bit
+# PathMap the same day, where the .act corruption regression sat unwired through two green runs).
+include("test_crdt.jl")
 
 @testset "OmegaClaw governed-action gate" begin
 

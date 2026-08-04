@@ -24,6 +24,7 @@ import MORK
 import TOML
 import JSON3
 
+include("CRDT.jl")
 include("Gate.jl")
 include("Ledger.jl")
 include("GroundedOps.jl")
