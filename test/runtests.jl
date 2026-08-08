@@ -1,6 +1,6 @@
 using Test
 using OmegaClaw
-# PRE-EXISTING BREAK, fixed 2026-08-04: the w2c testset (:368-371) calls `MeTTaCore.Interpreter.*`,
+# PRE-EXISTING BREAK, fixed 2026-08-04: the w2c testset (:368-371) calls `MeTTaCore.Eval.*`,
 # but `using MeTTaCore` INSIDE the OmegaClaw module does not bind the name `MeTTaCore` in Main — so
 # that testset raised UndefVarError on every run, independently of any change here.
 import MeTTaCore
@@ -369,10 +369,10 @@ include("test_crdt.jl")
         #       with the canonical map across a range — an independent Julia copy would have to be kept
         #       in sync by hand, which is precisely the failure this whole audit was about.
         w2c(n) = begin
-            sp = MeTTaCore.Interpreter.Space()
-            MeTTaCore.Interpreter.load_core_stdlib!(sp)
-            MeTTaCore.Interpreter.load_metta!(sp, "!(import! &self \"$(OmegaClaw._LIBPLN_ENTRY)\")")
-            parse(Float64, strip(string(MeTTaCore.Interpreter.load_metta!(sp, "!(Truth_w2c $n)")[1])))
+            sp = MeTTaCore.Eval.Space()
+            MeTTaCore.Eval.load_core_stdlib!(sp)
+            MeTTaCore.Eval.load_metta!(sp, "!(import! &self \"$(OmegaClaw._LIBPLN_ENTRY)\")")
+            parse(Float64, strip(string(MeTTaCore.Eval.load_metta!(sp, "!(Truth_w2c $n)")[1])))
         end
         for n in 1:4
             dn = Driver(; store = mktempdir(), ledger = Ledger())

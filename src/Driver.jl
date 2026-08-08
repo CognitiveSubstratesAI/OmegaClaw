@@ -334,7 +334,7 @@ end
 
 # Evaluate the MeTTa cadence rule `(should-retrain <pending> <surprise>)` in the driver's learn-space.
 # Returns True/False; any parse/eval failure ⇒ false (fail safe: don't retrain on garbage). `_SM =
-# MeTTaCore.Interpreter` (from GroundedOps.jl, same module). A non-finite surprise is normalized to 0.0 so
+# MeTTaCore.Eval` (from GroundedOps.jl, same module). A non-finite surprise is normalized to 0.0 so
 # only the pending branch can fire.
 function _should_retrain(d::Driver, pending::Int, surprise)::Bool
     s = (surprise === nothing || !isfinite(surprise)) ? 0.0 : Float64(surprise)

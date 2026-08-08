@@ -9,7 +9,7 @@
 
 using SHA: sha256
 import MORK
-const _SM = MeTTaCore.Interpreter
+const _SM = MeTTaCore.Eval
 
 # ── RequireProbe: a read-only precheck that is itself a typed proposal (§7.7) ──
 const PROBE_REGISTRY = Dict{String,Function}()   # action => (args)->(ok::Bool, evidence::String)
